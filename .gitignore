@@ -1,0 +1,45 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri & Builds
+src-tauri/target/
+release/
+*.exe
+*.msi
+
+# WebVault Data
+data/
+*.db
+*.db-journal
+*.db-wal
+*.warc
+*.warc.gz
+*.wacz
+
+# Logs & Environment
+logs/
+*.log
+.env
+.env.*
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Specs & Internal Docs
+*Spec*.md
+*spec*.md
+*PRD*.md
+*prd*.md
+Local_Web_Time_Machine_Development_Spec.md

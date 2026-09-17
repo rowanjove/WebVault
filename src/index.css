@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* 现代高级白灰质感调色板（浅灰底色 + 纯白卡片 + 清晰界限） */
+  --color-neutral-950: 240 242 245; /* 界面主工作区背景：柔和浅灰，彻底拉开与纯白卡片的层次 */
+  --color-neutral-900: 255 255 255; /* 卡片、弹窗背景：纯白 */
+  --color-neutral-800: 226 232 240; /* 边框、分割线：细腻清晰的灰线 */
+  --color-neutral-700: 203 213 225; /* 输入框与控件边框 */
+  --color-neutral-600: 148 163 184; /* 辅助边框与次要标识 */
+  --color-neutral-500: 100 116 139; /* 辅助说明、占位符文字（饱满高清晰，防发虚） */
+  --color-neutral-400: 71 85 105;   /* 次级正文文本、图标 */
+  --color-neutral-300: 51 65 85;    /* 常规正文文本 */
+  --color-neutral-200: 30 41 59;    /* 强调正文文本 */
+  --color-neutral-100: 15 23 42;    /* 主标题、重点文字（高对比度深黑字，极其锐利） */
+  --color-neutral-50: 2 6 23;      /* 最深色 */
+
+  /* 语义变量兼容 */
+  --background: 216 18% 95%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-foreground: 222 47% 11%;
+  --primary: 222 47% 11%;
+  --primary-foreground: 210 40% 98%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222 47% 11%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215 16% 47%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222 47% 11%;
+  --border: 214 32% 91%;
+  --input: 214 32% 91%;
+  --ring: 222 84% 4.9%;
+}
+
+.dark {
+  /* 深色（Dark）夜间调色板 */
+  --color-neutral-950: 10 10 10;
+  --color-neutral-900: 23 23 23;
+  --color-neutral-800: 38 38 38;
+  --color-neutral-700: 64 64 64;
+  --color-neutral-600: 82 82 82;
+  --color-neutral-500: 115 115 115;
+  --color-neutral-400: 163 163 163;
+  --color-neutral-300: 212 212 212;
+  --color-neutral-200: 229 229 229;
+  --color-neutral-100: 245 245 245;
+  --color-neutral-50: 250 250 250;
+
+  /* 语义变量兼容 */
+  --background: 240 10% 3.9%;
+  --foreground: 0 0% 98%;
+  --card: 240 10% 4.9%;
+  --card-foreground: 0 0% 98%;
+  --primary: 0 0% 98%;
+  --primary-foreground: 240 5.9% 10%;
+  --secondary: 240 3.7% 12.9%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 240 3.7% 12.9%;
+  --muted-foreground: 240 5% 64.9%;
+  --accent: 240 3.7% 14%;
+  --accent-foreground: 0 0% 98%;
+  --border: 240 3.7% 15%;
+  --input: 240 3.7% 15%;
+  --ring: 240 4.9% 83.9%;
+}
+
+/* 现代化滚动条样式，适配深浅主题 */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(100, 116, 139, 0.25);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.45);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.32);
+}
+
+/* 全局字体平滑抗锯齿与防发虚优化 */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  overflow: hidden;
+  user-select: none;
+}
+
+input, textarea, pre, code {
+  user-select: text;
+}
