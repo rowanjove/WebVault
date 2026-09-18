@@ -5,7 +5,7 @@ WebVault 是一款运行在本地桌面的离线网页时光机与数字资产�
 支持离线 1:1 高保真回放、版本时间轴追溯、DOM 差异比对、本地全文检索与 Internet Archive 历史互联，所有数据均严格保存在本地。
 
 [![Release](https://img.shields.io/github/v/release/rowanjove/webvault?color=blue&label=Latest%20Release)](https://github.com/rowanjove/webvault/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](https://github.com/rowanjove/webvault/releases/latest)
 
 > **[点击前往 GitHub Releases 下载 Windows 安装包 / 便携版](https://github.com/rowanjove/webvault/releases/latest)**
@@ -172,4 +172,4 @@ webvault serve --port 8080
 
 ## 开源协议
 
-本项目采用 [MIT License](LICENSE) 授权许可。
+本项目采用 [Apache-2.0 License](LICENSE) 授权许可。
