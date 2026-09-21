@@ -5,7 +5,7 @@ WebVault 是一款运行在本地桌面的离线网页时光机与数字资产�
 支持离线 1:1 高保真回放、版本时间轴追溯、DOM 差异比对、本地全文检索与 Internet Archive 历史互联，所有数据均严格保存在本地。
 
 [![Release](https://img.shields.io/github/v/release/rowanjove/webvault?color=blue&label=Latest%20Release)](https://github.com/rowanjove/webvault/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](https://github.com/rowanjove/webvault/releases/latest)
 
 > **[点击前往 GitHub Releases 下载 Windows 安装包 / 便携版](https://github.com/rowanjove/webvault/releases/latest)**
@@ -37,7 +37,7 @@ WebVault 的核心设计原则是**归档网络会话，而非单纯抓取文本
 
 ---
 
-## 核心特性
+## 核心特性与界面演示
 
 - **高保真网络会话捕获 (Capture)**  
   基于 CDP 驱动真实浏览器内核，捕获 HTML、CSS、JS、Web 字体、图片、XHR/Fetch 数据包；支持自动滚动、SPA 路由识别与动态渲染等待。
@@ -45,12 +45,21 @@ WebVault 的核心设计原则是**归档网络会话，而非单纯抓取文本
   支持 WARC 1.1 (ISO 28500) 格式分卷写入与哈希去重；提供 WACZ (Web Archive Collection Zipped) 格式的整站导入与导出。
 - **沙箱离线回放服务 (Replay)**  
   内置本地回放代理服务，通过正则重写资源链接与 CSP 策略隔离，断网状态下仍能 1:1 还原历史网页排版与交互。
+
+  ![网页时光机沙箱回放](docs/screenshots/timemachine.png)
+
 - **历史版本与差异对比 (Diff)**  
   同一 URL 多次抓取自动按时间线归集；支持并排对比两个历史版本的 DOM 结构、正文文本变动与元数据差异。
+
+  ![版本差异比对](docs/screenshots/diff.png)
+
 - **本地全文搜索引擎 (Search)**  
   基于 SQLite FTS5 引擎，对已抓取页面的正文和标题进行自动分词索引，支持秒级毫秒级本地全文检索。
 - **自动化监控巡检 (Monitor)**  
   支持按分钟/小时周期定时监控指定页面，发现内容变动时自动创建新快照并记录变动事件。
+
+  ![自动化页面监控与巡检](docs/screenshots/monitor.png)
+
 - **Wayback Machine 互联 (Federate)**  
   直连 Internet Archive CDX API，快速检索任意网址的历史归档，并支持一键将 Wayback 历史快照导入本地离线库。
 - **隐私与本地优先 (Local-First)**  
