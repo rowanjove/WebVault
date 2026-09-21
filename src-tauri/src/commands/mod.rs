@@ -2,9 +2,10 @@ use crate::archive::service::CapturePersistenceService;
 use crate::archive::singlefile::SingleFileExporter;
 use crate::archive::wacz::WaczPackage;
 use crate::archive::warc::WarcWriter;
-use crate::capture::browser::BrowserFinder;
+use crate::capture::browser::{BrowserFinder, BrowserProcess};
 use crate::capture::cdp::CdpClient;
 use crate::capture::credentials::CredentialManager;
+use crate::http_url::require_http_url;
 use crate::crawler::frontier::CrawlFrontier;
 use crate::crawler::scope::ScopeRule;
 use crate::database::models::*;
@@ -21,12 +22,55 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
 
+pub struct JobHandle {
+    pub cancel: Arc<AtomicBool>,
+    pub browser: Arc<Mutex<Option<BrowserProcess>>>,
+}
+
 pub struct AppState {
     pub db: Database,
     pub browser_path: Option<PathBuf>,
     pub replay_port: u16,
+    pub replay_token: String,
     pub wayback: WaybackProvider,
-    pub active_jobs: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    pub active_jobs: Arc<Mutex<HashMap<String, JobHandle>>>,
+}
+
+fn new_job_handle() -> JobHandle {
+    JobHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        browser: Arc::new(Mutex::new(None)),
+    }
+}
+
+async fn request_cancel(state: &AppState, job_id: &str) {
+    let handle = {
+        let mut jobs = state.active_jobs.lock().await;
+        jobs.remove(job_id)
+    };
+    if let Some(handle) = handle {
+        handle.cancel.store(true, Ordering::Relaxed);
+        if let Some(browser) = handle.browser.lock().await.take() {
+            drop(browser);
+        }
+    }
+    if let Ok(conn) = state.db.lock_conn() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = conn.execute(
+            "UPDATE crawl_jobs SET status = 'cancelled', finished_at = ?1 WHERE id = ?2 AND status = 'running'",
+            rusqlite::params![now, job_id],
+        );
+    }
+}
+
+fn mark_job(db: &Database, job_id: &str, status: &str) {
+    if let Ok(conn) = db.lock_conn() {
+        let finish_now = chrono::Utc::now().timestamp_millis();
+        let _ = conn.execute(
+            "UPDATE crawl_jobs SET status = ?1, finished_at = ?2 WHERE id = ?3 AND status = 'running'",
+            rusqlite::params![status, finish_now, job_id],
+        );
+    }
 }
 
 #[tauri::command]
@@ -61,6 +105,19 @@ pub async fn create_site(
 
 #[tauri::command]
 pub async fn delete_site(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let running: Vec<String> = {
+        let conn = state.db.lock_conn().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id FROM crawl_jobs WHERE site_id = ?1 AND status = 'running'")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for job_id in running {
+        request_cancel(&state, &job_id).await;
+    }
     state.db.delete_site(&id).map_err(|e| e.to_string())
 }
 
@@ -121,6 +178,8 @@ pub async fn start_single_capture(
     site_id: String,
     url: String,
 ) -> Result<String, String> {
+    let _ = require_http_url(&url).map_err(|e| e.to_string())?;
+
     let browser_path = state
         .browser_path
         .clone()
@@ -142,8 +201,21 @@ pub async fn start_single_capture(
 
     let job_id_clone = job_id.clone();
     let url_clone = url.clone();
+    let active_jobs = state.active_jobs.clone();
+    let handle = new_job_handle();
+    let cancel_flag = handle.cancel.clone();
+    let browser_slot = handle.browser.clone();
+    {
+        let mut jobs = active_jobs.lock().await;
+        jobs.insert(job_id.clone(), handle);
+    }
 
     tokio::spawn(async move {
+        let unregister = || async {
+            if let Some(h) = active_jobs.lock().await.remove(&job_id_clone) {
+                let _ = h.browser.lock().await.take();
+            }
+        };
         let temp_dir = db.base_dir.join("temp");
         let site_profile_dir = db.base_dir.join("browser_profiles").join(&site_id);
         let launch_options = crate::capture::browser::BrowserLaunchOptions {
@@ -157,18 +229,20 @@ pub async fn start_single_capture(
             Ok(b) => b,
             Err(e) => {
                 tracing::error!("Failed to launch browser: {}", e);
-                if let Ok(conn) = db.lock_conn() {
-                    let finish_now = chrono::Utc::now().timestamp_millis();
-                    let _ = conn.execute(
-                        "UPDATE crawl_jobs SET status = 'failed', error_count = 1, finished_at = ?1 WHERE id = ?2",
-                        rusqlite::params![finish_now, job_id_clone],
-                    );
-                }
+                mark_job(&db, &job_id_clone, "failed");
+                unregister().await;
                 return;
             }
         };
+        let cdp_port = browser.port;
+        *browser_slot.lock().await = Some(browser);
+        if cancel_flag.load(Ordering::Relaxed) {
+            mark_job(&db, &job_id_clone, "cancelled");
+            unregister().await;
+            return;
+        }
 
-        let client = CdpClient::new(browser.port);
+        let client = CdpClient::new(cdp_port);
         let creds = db.get_site_credentials(&site_id).ok();
         let (cookies_json, storage_json) = if let Some(ref list) = creds {
             if let Some(first) = list.first() {
@@ -190,16 +264,17 @@ pub async fn start_single_capture(
             Ok(res) => res,
             Err(e) => {
                 tracing::error!("Capture failed for {}: {}", url_clone, e);
-                if let Ok(conn) = db.lock_conn() {
-                    let finish_now = chrono::Utc::now().timestamp_millis();
-                    let _ = conn.execute(
-                        "UPDATE crawl_jobs SET status = 'failed', error_count = 1, finished_at = ?1 WHERE id = ?2",
-                        rusqlite::params![finish_now, job_id_clone],
-                    );
-                }
+                mark_job(&db, &job_id_clone, "failed");
+                unregister().await;
                 return;
             }
         };
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            mark_job(&db, &job_id_clone, "cancelled");
+            unregister().await;
+            return;
+        }
 
         let warc_rel_path = format!("archives/{}/data.warc.gz", site_id);
         let warc_full_path = db.base_dir.join(&warc_rel_path);
@@ -217,7 +292,7 @@ pub async fn start_single_capture(
                             resources_captured = ?1,
                             bytes_written = ?2,
                             finished_at = ?3
-                        WHERE id = ?4
+                        WHERE id = ?4 AND status = 'running'
                         "#,
                         rusqlite::params![
                             capture_res.resource_count as i64,
@@ -230,15 +305,12 @@ pub async fn start_single_capture(
             }
             Err(e) => {
                 tracing::error!("Failed to persist capture for {}: {}", url_clone, e);
-                if let Ok(conn) = db.lock_conn() {
-                    let finish_now = chrono::Utc::now().timestamp_millis();
-                    let _ = conn.execute(
-                        "UPDATE crawl_jobs SET status = 'failed', error_count = 1, finished_at = ?1 WHERE id = ?2",
-                        rusqlite::params![finish_now, job_id_clone],
-                    );
-                }
+                mark_job(&db, &job_id_clone, "failed");
+                unregister().await;
+                return;
             }
         }
+        unregister().await;
     });
 
     Ok(job_id)
@@ -269,15 +341,25 @@ pub async fn start_crawl_job(
         );
     }
 
-    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let handle = new_job_handle();
+    let cancel_flag = handle.cancel.clone();
+    let browser_slot = handle.browser.clone();
     {
         let mut jobs = state.active_jobs.lock().await;
-        jobs.insert(job_id.clone(), cancel_flag.clone());
+        jobs.insert(job_id.clone(), handle);
     }
 
     let job_id_clone = job_id.clone();
+    let active_jobs = state.active_jobs.clone();
     tokio::spawn(async move {
+        let unregister = || async {
+            if let Some(h) = active_jobs.lock().await.remove(&job_id_clone) {
+                let _ = h.browser.lock().await.take();
+            }
+        };
         let profile = db.get_site_profile(&site_id).unwrap_or_default();
+        let max_duration = std::time::Duration::from_secs((profile.max_duration_minutes.max(1) as u64) * 60);
+        let crawl_started = std::time::Instant::now();
         let site_info = {
             let conn = db.lock_conn().ok();
             conn.and_then(|c| {
@@ -291,7 +373,11 @@ pub async fn start_crawl_job(
 
         let root_url = match site_info {
             Some(u) => u,
-            None => return,
+            None => {
+                mark_job(&db, &job_id_clone, "failed");
+                unregister().await;
+                return;
+            }
         };
 
         let scope = ScopeRule::from_profile(
@@ -309,11 +395,13 @@ pub async fn start_crawl_job(
             profile.max_pages as usize,
         );
 
-        // Discover Sitemap URLs
-        let sitemap_limit = (profile.max_pages as usize).min(100);
-        let sitemap_urls = crate::crawler::sitemap::SitemapFinder::discover_sitemap_urls(&root_url, sitemap_limit).await;
-        for sm_url in sitemap_urls {
-            frontier.add_url(&sm_url, 1, Some(root_url.clone()));
+        // Sitemap is opt-in via high page budgets so a normal crawl starts from the cover page.
+        if profile.max_pages >= 50 && profile.scope_type != "current" {
+            let sitemap_limit = (profile.max_pages as usize / 10).clamp(5, 30);
+            let sitemap_urls = crate::crawler::sitemap::SitemapFinder::discover_sitemap_urls(&root_url, sitemap_limit).await;
+            for sm_url in sitemap_urls {
+                frontier.add_url(&sm_url, 1, Some(root_url.clone()));
+            }
         }
 
         // Persist initial queue in crawl_queue table
@@ -342,11 +430,15 @@ pub async fn start_crawl_job(
             Ok(b) => b,
             Err(e) => {
                 tracing::error!("Failed to launch crawler browser: {}", e);
+                mark_job(&db, &job_id_clone, "failed");
+                unregister().await;
                 return;
             }
         };
+        let cdp_port = browser.port;
+        *browser_slot.lock().await = Some(browser);
 
-        let client = Arc::new(CdpClient::new(browser.port));
+        let client = Arc::new(CdpClient::new(cdp_port));
         let warc_rel_path = format!("archives/{}/data.warc.gz", site_id);
         let warc_full_path = db.base_dir.join(&warc_rel_path);
         let writer = Arc::new(tokio::sync::Mutex::new(WarcWriter::new(&warc_full_path)));
@@ -388,6 +480,10 @@ pub async fn start_crawl_job(
             if cancel_flag.load(Ordering::Relaxed) {
                 break;
             }
+            if crawl_started.elapsed() >= max_duration {
+                tracing::info!("Crawl job {} reached max duration ({} min)", job_id_clone, profile.max_duration_minutes);
+                break;
+            }
             if total_bytes_written.load(Ordering::Relaxed) >= max_bytes {
                 tracing::info!("Crawl job {} reached max size limit ({} MB)", job_id_clone, profile.max_size_mb);
                 break;
@@ -418,6 +514,7 @@ pub async fn start_crawl_job(
                     let site_cookies = site_cookies.clone();
                     let site_storage = site_storage.clone();
                     let site_scripts = site_scripts.clone();
+                    let cancel_flag = cancel_flag.clone();
 
                     // Update crawl_queue status to processing
                     if let Ok(conn) = db.lock_conn() {
@@ -439,6 +536,9 @@ pub async fn start_crawl_job(
                             site_storage.as_ref().as_deref(),
                             scripts_slice,
                         ).await;
+                        if cancel_flag.load(Ordering::Relaxed) {
+                            return;
+                        }
                         match capture_res {
                             Ok(capture_res) => {
                                 let persist_res = {
@@ -554,14 +654,19 @@ pub async fn start_crawl_job(
         // Await any remaining in-flight tasks
         while let Some(_) = join_set.join_next().await {}
 
-        // Finish job
         if let Ok(conn) = db.lock_conn() {
             let finish_now = chrono::Utc::now().timestamp_millis();
+            let status = if cancel_flag.load(Ordering::Relaxed) {
+                "cancelled"
+            } else {
+                "completed"
+            };
             let _ = conn.execute(
-                "UPDATE crawl_jobs SET status = 'completed', finished_at = ?1 WHERE id = ?2",
-                rusqlite::params![finish_now, job_id_clone],
+                "UPDATE crawl_jobs SET status = ?1, finished_at = ?2 WHERE id = ?3 AND status = 'running'",
+                rusqlite::params![status, finish_now, job_id_clone],
             );
         }
+        unregister().await;
     });
 
     Ok(job_id)
@@ -610,22 +715,17 @@ pub async fn list_jobs(state: State<'_, AppState>) -> Result<Vec<CrawlJob>, Stri
 
 #[tauri::command]
 pub async fn cancel_job(state: State<'_, AppState>, job_id: String) -> Result<(), String> {
-    let mut jobs = state.active_jobs.lock().await;
-    if let Some(flag) = jobs.remove(&job_id) {
-        flag.store(true, Ordering::Relaxed);
-    }
-    let conn = state.db.lock_conn().map_err(|e| e.to_string())?;
-    let _ = conn.execute(
-        "UPDATE crawl_jobs SET status = 'cancelled' WHERE id = ?1",
-        rusqlite::params![job_id],
-    );
+    request_cancel(&state, &job_id).await;
     Ok(())
 }
 
 // Replay
 #[tauri::command]
 pub async fn get_replay_url(state: State<'_, AppState>, capture_id: String) -> Result<String, String> {
-    Ok(format!("http://127.0.0.1:{}/replay/{}", state.replay_port, capture_id))
+    Ok(format!(
+        "http://127.0.0.1:{}/replay/{}?t={}",
+        state.replay_port, capture_id, state.replay_token
+    ))
 }
 
 // Search
@@ -688,7 +788,7 @@ pub async fn list_change_events(state: State<'_, AppState>) -> Result<Vec<Change
 
 #[tauri::command]
 pub async fn trigger_monitor_check(state: State<'_, AppState>) -> Result<(), String> {
-    let monitor = MonitorEngine::new(state.db.clone());
+    let monitor = MonitorEngine::new(state.db.clone()).with_browser(state.browser_path.clone());
     monitor.check_pending_rules().await.map_err(|e| e.to_string())
 }
 
@@ -874,144 +974,8 @@ pub async fn export_wacz(
 
 #[tauri::command]
 pub async fn import_wacz(state: State<'_, AppState>, file_path: String) -> Result<Site, String> {
-    let temp_dest = state.db.base_dir.join("temp").join(format!("imp_{}", uuid::Uuid::new_v4().simple()));
-    let unpacked = WaczPackage::unpack_wacz(&file_path, &temp_dest)
-        .map_err(|e| e.to_string())?;
-
-    // 1. Determine root url and initial pages from pages_jsonl or cdx
-    let mut initial_root_url = String::new();
-    let mut parsed_pages = Vec::new();
-
-    if let Some(ref pj) = unpacked.pages_jsonl {
-        for line in pj.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                let url = v["url"].as_str().unwrap_or_default().to_string();
-                let title = v["title"].as_str().unwrap_or_default().to_string();
-                let ts = v["ts"].as_str().unwrap_or_default();
-                let epoch_ms = chrono::DateTime::parse_from_rfc3339(ts)
-                    .map(|dt| dt.timestamp_millis())
-                    .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
-                if !url.is_empty() {
-                    if initial_root_url.is_empty() {
-                        initial_root_url = url.clone();
-                    }
-                    parsed_pages.push((url, title, epoch_ms));
-                }
-            }
-        }
-    }
-
-    if initial_root_url.is_empty() {
-        initial_root_url = format!("https://imported.local/{}", uuid::Uuid::new_v4().simple());
-    }
-
-    let site = state
-        .db
-        .create_site(&unpacked.title, &initial_root_url)
-        .map_err(|e| e.to_string())?;
-
-    let site_warc_rel = format!("archives/{}/data.warc.gz", site.id);
-    let site_warc_full = state.db.base_dir.join(&site_warc_rel);
-    if let Some(p) = site_warc_full.parent() {
-        let _ = std::fs::create_dir_all(p);
-    }
-    std::fs::copy(&unpacked.warc_path, &site_warc_full).map_err(|e| e.to_string())?;
-
-    // 2. Index pages and captures into SQLite
-    let normalizer = crate::crawler::normalizer::UrlNormalizer::new();
-    let now = chrono::Utc::now().timestamp_millis();
-
-    if let Ok(conn) = state.db.lock_conn() {
-        // A. Insert parsed pages from pages.jsonl
-        for (url, title, ts) in parsed_pages {
-            let norm_url = normalizer.normalize(&url).unwrap_or_else(|_| url.clone());
-            let page_id = format!("page_{}", uuid::Uuid::new_v4().simple());
-            let cap_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
-
-            let _ = conn.execute(
-                r#"
-                INSERT INTO pages (id, site_id, url, normalized_url, title, first_seen, last_seen, capture_count)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
-                ON CONFLICT(site_id, normalized_url) DO UPDATE SET
-                    capture_count = capture_count + 1,
-                    title = excluded.title
-                "#,
-                rusqlite::params![page_id, site.id, url, norm_url, title, ts, ts],
-            );
-
-            let actual_page_id: String = conn.query_row(
-                "SELECT id FROM pages WHERE site_id = ?1 AND normalized_url = ?2",
-                rusqlite::params![site.id, norm_url],
-                |r| r.get(0),
-            ).unwrap_or(page_id);
-
-            let _ = conn.execute(
-                r#"
-                INSERT INTO captures (
-                    id, page_id, job_id, captured_at, status_code, mime_type,
-                    warc_file, warc_offset, warc_length, capture_score
-                ) VALUES (?1, ?2, 'wacz_import', ?3, 200, 'text/html', ?4, 0, 0, 100.0)
-                "#,
-                rusqlite::params![cap_id, actual_page_id, ts, site_warc_rel],
-            );
-        }
-
-        // B. If cdx_content is present, parse records and map to captures/resources
-        if let Some(ref cdx) = unpacked.cdx_content {
-            for line in cdx.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') || line.starts_with(" CDX") { continue; }
-                if let Some(json_start) = line.find('{') {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line[json_start..]) {
-                        let url = v["url"].as_str().unwrap_or_default();
-                        let mime = v["mime"].as_str().unwrap_or("application/octet-stream");
-                        let status: i32 = v["status"].as_str().and_then(|s| s.parse().ok()).unwrap_or(200);
-                        let offset: i64 = v["offset"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let length: i64 = v["length"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
-                        let digest = v["digest"].as_str();
-
-                        if url.is_empty() { continue; }
-
-                        let norm_url = normalizer.normalize(url).unwrap_or_else(|_| url.to_string());
-                        if mime.contains("text/html") {
-                            let page_id = format!("page_{}", uuid::Uuid::new_v4().simple());
-                            let cap_id = format!("cap_{}", uuid::Uuid::new_v4().simple());
-
-                            let _ = conn.execute(
-                                r#"
-                                INSERT INTO pages (id, site_id, url, normalized_url, title, first_seen, last_seen, capture_count)
-                                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
-                                ON CONFLICT(site_id, normalized_url) DO UPDATE SET capture_count = capture_count + 1
-                                "#,
-                                rusqlite::params![page_id, site.id, url, norm_url, url, now, now],
-                            );
-
-                            let actual_page_id: String = conn.query_row(
-                                "SELECT id FROM pages WHERE site_id = ?1 AND normalized_url = ?2",
-                                rusqlite::params![site.id, norm_url],
-                                |r| r.get(0),
-                            ).unwrap_or(page_id);
-
-                            let _ = conn.execute(
-                                r#"
-                                INSERT INTO captures (
-                                    id, page_id, job_id, captured_at, status_code, mime_type,
-                                    warc_file, warc_offset, warc_length, text_hash, capture_score
-                                ) VALUES (?1, ?2, 'wacz_import', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 100.0)
-                                "#,
-                                rusqlite::params![cap_id, actual_page_id, now, status, mime, site_warc_rel, offset, length, digest],
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = std::fs::remove_dir_all(&temp_dest);
-    Ok(site)
+    crate::archive::wacz::WaczPackage::import_into_db(&state.db, std::path::Path::new(&file_path))
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1041,10 +1005,13 @@ pub async fn save_site_credential(
     let (cookies_json, storage_json) = CredentialManager::extract_browser_credentials(port)
         .await
         .map_err(|e| e.to_string())?;
-    state
+    let mut saved = state
         .db
         .save_site_credential(&site_id, &name, &cookies_json, &storage_json)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    saved.cookies_json = String::new();
+    saved.storage_json = String::new();
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -1052,7 +1019,12 @@ pub async fn get_site_credentials(
     state: State<'_, AppState>,
     site_id: String,
 ) -> Result<Vec<SiteCredential>, String> {
-    state.db.get_site_credentials(&site_id).map_err(|e| e.to_string())
+    let mut list = state.db.get_site_credentials(&site_id).map_err(|e| e.to_string())?;
+    for cred in &mut list {
+        cred.cookies_json = String::new();
+        cred.storage_json = String::new();
+    }
+    Ok(list)
 }
 
 #[tauri::command]
@@ -1097,7 +1069,7 @@ pub async fn export_page_offline(
                 .map_err(|e| e.to_string())?;
         }
         "pdf" => {
-            SingleFileExporter::export_pdf(&state.db, &capture_id, state.replay_port, &resolved_path)
+            SingleFileExporter::export_pdf(&state.db, &capture_id, state.replay_port, &state.replay_token, &resolved_path)
                 .await
                 .map_err(|e| e.to_string())?;
         }
@@ -1239,6 +1211,25 @@ pub async fn sync_rss_feed(
     feed_id: String,
 ) -> Result<usize, String> {
     state.db.sync_rss_feed(&feed_id).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn export_backup(state: State<'_, AppState>, output_path: String) -> Result<String, String> {
+    let raw_path = std::path::PathBuf::from(&output_path);
+    let resolved = if raw_path.is_relative() {
+        let dir = state.db.base_dir.join("exports");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(raw_path)
+    } else {
+        raw_path
+    };
+    crate::backup::export_backup(&state.db, &resolved).map_err(|e| e.to_string())?;
+    Ok(resolved.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn import_backup(state: State<'_, AppState>, file_path: String) -> Result<(), String> {
+    crate::backup::import_backup(&state.db, std::path::Path::new(&file_path)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

@@ -43,7 +43,7 @@ interface AppState {
   // Diff pair
   diffOldCaptureId: string | null;
   diffNewCaptureId: string | null;
-  setDiffPair: (oldId: string, newId: string) => void;
+  setDiffPair: (oldId: string, newId: string, ctx?: { siteId?: string | null; pageId?: string | null }) => void;
 
   // Cached sites & stats
   sites: Site[];
@@ -104,12 +104,15 @@ export const useAppStore = create<AppState>((set) => ({
 
   diffOldCaptureId: null,
   diffNewCaptureId: null,
-  setDiffPair: (oldId, newId) => set({
+  setDiffPair: (oldId, newId, ctx) => set((state) => ({
     diffOldCaptureId: oldId,
     diffNewCaptureId: newId,
     currentTab: 'timemachine',
     timeMachineMode: 'diff',
-  }),
+    selectedSiteId: ctx?.siteId !== undefined ? ctx.siteId : state.selectedSiteId,
+    selectedPageId: ctx?.pageId !== undefined ? ctx.pageId : state.selectedPageId,
+    selectedCaptureId: newId,
+  })),
 
   sites: [],
   setSites: (sites) => set({ sites }),

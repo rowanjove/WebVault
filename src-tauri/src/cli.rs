@@ -52,7 +52,7 @@ pub async fn handle_cli(args: Vec<String>) -> Result<bool> {
             Ok(true)
         }
         "--version" | "-V" | "-v" | "version" => {
-            println!("WebVault Local Web Time Machine v0.1.0");
+            println!("WebVault Local Web Time Machine v0.1.1");
             Ok(true)
         }
         "stats" => {
@@ -106,29 +106,87 @@ pub async fn handle_cli(args: Vec<String>) -> Result<bool> {
             }
             Ok(true)
         }
-        "export" => {
-            if args.len() < 3 {
-                eprintln!("Error: Missing capture ID. Usage: webvault export <capture_id> [--format <html|pdf>] [--output <path>]");
-                return Ok(true);
-            }
-            let capture_id = &args[2];
-            let mut format = "singlefile".to_string();
-            let mut output_path = format!("webvault_{}_{}.html", capture_id, chrono::Utc::now().timestamp());
-
-            let mut i = 3;
+        "serve" => {
+            let mut port: u16 = 0;
+            let mut i = 2;
             while i < args.len() {
-                if args[i] == "--format" && i + 1 < args.len() {
-                    format = args[i + 1].clone();
-                    if format == "pdf" && output_path.ends_with(".html") {
-                        output_path = output_path.replace(".html", ".pdf");
-                    }
-                    i += 2;
-                } else if args[i] == "--output" && i + 1 < args.len() {
-                    output_path = args[i + 1].clone();
+                if args[i] == "--port" && i + 1 < args.len() {
+                    port = args[i + 1].parse().unwrap_or(0);
                     i += 2;
                 } else {
                     i += 1;
                 }
+            }
+            let data_dir = get_default_data_dir();
+            let db = Database::init(&data_dir)?;
+            let server = if port == 0 {
+                crate::replay::server::ReplayServer::start(db).await?
+            } else {
+                crate::replay::server::ReplayServer::bind(db, port).await?
+            };
+            println!("WebVault replay server listening on http://127.0.0.1:{}", server.port);
+            println!("Replay URL example: http://127.0.0.1:{}/replay/<capture_id>?t={}", server.port, server.token);
+            std::future::pending::<()>().await;
+            Ok(true)
+        }
+        "export" => {
+            let mut site_id: Option<String> = None;
+            let mut capture_id: Option<String> = None;
+            let mut format = "singlefile".to_string();
+            let mut output_path = String::new();
+            let mut i = 2;
+            while i < args.len() {
+                if args[i] == "--site-id" && i + 1 < args.len() {
+                    site_id = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i] == "--format" && i + 1 < args.len() {
+                    format = args[i + 1].clone();
+                    i += 2;
+                } else if args[i] == "--output" && i + 1 < args.len() {
+                    output_path = args[i + 1].clone();
+                    i += 2;
+                } else if !args[i].starts_with('-') && capture_id.is_none() && site_id.is_none() {
+                    capture_id = Some(args[i].clone());
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+
+            if let Some(sid) = site_id {
+                let data_dir = get_default_data_dir();
+                if output_path.is_empty() {
+                    output_path = format!("{}.wacz", sid);
+                }
+                let warc_rel = format!("archives/{}/data.warc.gz", sid);
+                let warc_full = data_dir.join(&warc_rel);
+                if !warc_full.exists() {
+                    anyhow::bail!("No WARC archive exists for this site yet");
+                }
+                let out = PathBuf::from(&output_path);
+                crate::archive::wacz::WaczPackage::create_wacz(
+                    &warc_full,
+                    &out,
+                    &format!("WebVault Export - {}", sid),
+                    "Exported from WebVault CLI",
+                    "",
+                    None,
+                )?;
+                println!("WACZ exported: {}", output_path);
+                return Ok(true);
+            }
+
+            let capture_id = match capture_id {
+                Some(id) => id,
+                None => {
+                    eprintln!("Error: Missing capture ID. Usage: webvault export <capture_id> [--format <html|pdf>] [--output <path>]");
+                    eprintln!("       webvault export --site-id <SITE_ID> --output archive.wacz");
+                    return Ok(true);
+                }
+            };
+            if output_path.is_empty() {
+                let ext = if format == "pdf" { "pdf" } else { "html" };
+                output_path = format!("webvault_{}_{}.{}", capture_id, chrono::Utc::now().timestamp(), ext);
             }
 
             let data_dir = get_default_data_dir();
@@ -138,9 +196,9 @@ pub async fn handle_cli(args: Vec<String>) -> Result<bool> {
             println!("Exporting capture {} to {} (format: {})...", capture_id, output_path, format);
             if format == "pdf" {
                 let replay_server = crate::replay::server::ReplayServer::start(db.clone()).await?;
-                SingleFileExporter::export_pdf(&db, capture_id, replay_server.port, &path).await?;
+                SingleFileExporter::export_pdf(&db, &capture_id, replay_server.port, &replay_server.token, &path).await?;
             } else {
-                SingleFileExporter::export_single_file_html(&db, capture_id, &path)?;
+                SingleFileExporter::export_single_file_html(&db, &capture_id, &path)?;
             }
             println!("Export completed successfully: {}", output_path);
             Ok(true)
@@ -201,7 +259,7 @@ pub async fn handle_cli(args: Vec<String>) -> Result<bool> {
 
 fn print_help() {
     println!(
-        r#"WebVault - Local Web Time Machine (v0.1.0)
+        r#"WebVault - Local Web Time Machine (v0.1.1)
 High-Fidelity Offline Archiving, Replay & Time-Travel Engine
 
 Usage:
@@ -210,6 +268,8 @@ Usage:
 Available Commands:
   capture <url> [--autoscroll]              Capture and archive a web page via CDP
   export <capture_id> [--format <html|pdf>] Export snapshot as single-file HTML or PDF
+  export --site-id <SITE_ID> --output f.wacz  Export a site archive as WACZ
+  serve [--port 8080]                       Start local offline replay HTTP server
   search <query>                            Search text and titles in historical archives
   list-sites                                List all archived sites and domains
   stats                                     Display total captures, pages, and storage usage

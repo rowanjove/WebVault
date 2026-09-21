@@ -206,6 +206,11 @@ CREATE TABLE IF NOT EXISTS rss_feeds (
     UNIQUE(site_id, feed_url)
 );
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_pages USING fts5(
     page_id UNINDEXED,
     capture_id UNINDEXED,

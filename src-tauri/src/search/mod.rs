@@ -20,7 +20,14 @@ impl SearchEngine {
             INSERT INTO fts_pages (page_id, capture_id, url, title, clean_text, meta_desc)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             "#,
-            rusqlite::params![page_id, capture_id, url, title, clean_text, meta_desc],
+            rusqlite::params![
+                page_id,
+                capture_id,
+                url,
+                cjk_space_separate(title),
+                cjk_space_separate(clean_text),
+                cjk_space_separate(meta_desc)
+            ],
         )?;
         Ok(())
     }
@@ -38,13 +45,12 @@ impl SearchEngine {
             } else if let Some(title_term) = word.strip_prefix("title:") {
                 let clean = title_term.replace('"', "").replace('*', "");
                 if !clean.is_empty() {
-                    fts_terms.push(format!("title:\"{}\"", clean));
+                    fts_terms.push(format!("title:{}", quote_fts_term(&clean)));
                 }
             } else if !word.is_empty() {
-                // Remove special FTS syntax chars that might cause syntax errors
                 let clean = word.replace('"', "").replace('*', "");
                 if !clean.is_empty() {
-                    fts_terms.push(format!("\"{}\"", clean));
+                    fts_terms.push(quote_fts_term(&clean));
                 }
             }
         }
@@ -59,8 +65,8 @@ impl SearchEngine {
             r#"
             SELECT 
                 f.page_id, f.capture_id, p.site_id, s.name as site_name,
-                f.url, f.title, c.captured_at,
-                snippet(fts_pages, 4, '<mark>', '</mark>', '...', 25) as snippet,
+                f.url, COALESCE(p.title, f.title), c.captured_at,
+                snippet(fts_pages, 4, char(1), char(2), '...', 25) as snippet,
                 bm25(fts_pages) as rank
             FROM fts_pages f
             JOIN captures c ON f.capture_id = c.id
@@ -93,7 +99,9 @@ impl SearchEngine {
                 })
             })?;
             for r in rows {
-                results.push(r?);
+                let mut item = r?;
+                item.snippet = compact_cjk_display(&sanitize_snippet(&item.snippet));
+                results.push(item);
             }
         } else {
             let mut stmt = conn.prepare(&sql)?;
@@ -111,11 +119,84 @@ impl SearchEngine {
                 })
             })?;
             for r in rows {
-                results.push(r?);
+                let mut item = r?;
+                item.snippet = compact_cjk_display(&sanitize_snippet(&item.snippet));
+                results.push(item);
             }
         }
         Ok(results)
     }
+}
+
+pub fn sanitize_snippet(raw: &str) -> String {
+    let escaped = html_escape(raw);
+    escaped.replace('\u{0001}', "<mark>").replace('\u{0002}', "</mark>")
+}
+
+pub fn cjk_space_separate(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_cjk = false;
+    for c in s.chars() {
+        let is_cjk = is_cjk_char(c);
+        if is_cjk {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            out.push(c);
+            out.push(' ');
+            prev_cjk = true;
+        } else {
+            if prev_cjk && !c.is_whitespace() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            out.push(c);
+            prev_cjk = false;
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{2A6DF}'
+    )
+}
+
+fn quote_fts_term(term: &str) -> String {
+    let spaced = cjk_space_separate(term);
+    format!("\"{}\"", spaced.replace('"', ""))
+}
+
+pub fn compact_cjk_display(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for i in 0..chars.len() {
+        if chars[i] == ' ' && i > 0 && i + 1 < chars.len() {
+            let prev = chars[i - 1];
+            let next = chars[i + 1];
+            if is_cjk_char(prev) && is_cjk_char(next) {
+                continue;
+            }
+        }
+        out.push(chars[i]);
+    }
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -162,6 +243,24 @@ mod tests {
         // 2. title: prefix search
         let res2 = SearchEngine::search(&db, "title:Fast", None).unwrap();
         assert_eq!(res2.len(), 1);
+
+        SearchEngine::index_page(
+            &db,
+            page_id,
+            cap_id,
+            "https://rust-lang.org/learn",
+            "中文标题",
+            "今天天气很好而且适合出门归档网页",
+            "",
+        ).unwrap();
+        let zh = SearchEngine::search(&db, "天气", None).unwrap();
+        assert!(!zh.is_empty(), "CJK character indexing must match Chinese substrings");
+
+        assert_eq!(
+            sanitize_snippet(&format!("hello\u{0001}<img src=x>\u{0002}world")),
+            "hello<mark>&lt;img src=x&gt;</mark>world"
+        );
+        assert_eq!(compact_cjk_display("哔 哩 哔 哩 ~-bilibili"), "哔哩哔哩 ~-bilibili");
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

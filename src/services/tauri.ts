@@ -212,4 +212,31 @@ export const api = {
   openFolder: async (path: string): Promise<void> => {
     return invoke('open_folder', { path });
   },
+  exportBackup: async (outputPath: string): Promise<string> => {
+    return invoke('export_backup', { outputPath });
+  },
+  importBackup: async (filePath: string): Promise<void> => {
+    return invoke('import_backup', { filePath });
+  },
 };
+
+export async function pickOpenFile(filters: { name: string; extensions: string[] }[]): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt('请输入文件路径') || null;
+  }
+  const { open } = await import('@tauri-apps/plugin-dialog');
+  const selected = await open({ multiple: false, filters });
+  if (!selected || Array.isArray(selected)) return null;
+  return selected;
+}
+
+export async function pickSaveFile(opts: {
+  defaultPath: string;
+  filters: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  if (!isTauri()) {
+    return window.prompt('请输入保存路径', opts.defaultPath) || null;
+  }
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  return save(opts);
+}

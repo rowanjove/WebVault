@@ -22,7 +22,7 @@ import {
   Activity,
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
-import { api } from '../../services/tauri';
+import { api, pickSaveFile } from '../../services/tauri';
 import { toast } from '../../components/ui/Toast';
 import type { Site, PageItem, CrawlProfile, SiteCredential, UserScriptItem, RssFeedItem } from '../../types';
 
@@ -172,7 +172,7 @@ export const Sites: React.FC = () => {
     try {
       setSyncingRssId(id);
       const newArticles = await api.syncRssFeed(id);
-      toast.success(`RSS 同步完成！发现并导入 ${newArticles} 篇新文章。`);
+      toast.success(`RSS 同步完成，发现 ${newArticles} 条新链接（尚未抓取）。`);
       if (selectedSiteId) {
         const updatedPages = await api.listPages(selectedSiteId);
         setPages(updatedPages);
@@ -293,10 +293,30 @@ export const Sites: React.FC = () => {
     }
   };
 
+  const handleCaptureCover = async () => {
+    if (!selectedSiteId || !activeSite) return;
+    try {
+      await api.startSingleCapture({ siteId: selectedSiteId, url: activeSite.root_url });
+      toast.success('已开始抓取封面（仅当前页）');
+      setCurrentTab('tasks');
+    } catch (e: any) {
+      toast.error(`抓取封面失败: ${e?.toString()}`);
+    }
+  };
+
   const handleStartCrawl = async () => {
     if (!selectedSiteId) return;
+    const maxPages = profile?.max_pages ?? 500;
+    if (
+      !confirm(
+        `整站抓取会顺着链接继续访问，最多 ${maxPages} 页，可能很久。只要首页请用「抓封面」。确定继续？`
+      )
+    ) {
+      return;
+    }
     try {
       await api.startCrawlJob({ siteId: selectedSiteId });
+      toast.success('已开始整站抓取');
       setCurrentTab('tasks');
     } catch (e: any) {
       toast.error(`启动爬虫失败: ${e?.toString()}`);
@@ -322,7 +342,11 @@ export const Sites: React.FC = () => {
   const handleExportWacz = async () => {
     if (!selectedSiteId || !activeSite) return;
     try {
-      const exportPath = `${activeSite.name}_${Date.now()}.wacz`;
+      const exportPath = await pickSaveFile({
+        defaultPath: `${activeSite.name}_${Date.now()}.wacz`,
+        filters: [{ name: 'WACZ', extensions: ['wacz'] }],
+      });
+      if (!exportPath) return;
       const resultPath = await api.exportWacz({ siteId: selectedSiteId, outputPath: exportPath });
       toast.success(`WACZ 归档导出成功：${resultPath || exportPath}`);
     } catch (e: any) {
@@ -416,10 +440,18 @@ export const Sites: React.FC = () => {
 
             <div className="flex items-center gap-2.5">
               <button
-                onClick={handleStartCrawl}
+                onClick={handleCaptureCover}
                 className="flex items-center gap-2 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold transition shadow-xs cursor-pointer active:scale-95"
+                title="只抓站点首页这一页，不顺着链接往下爬"
               >
                 <Play className="w-3.5 h-3.5 fill-white" />
+                抓封面
+              </button>
+              <button
+                onClick={handleStartCrawl}
+                className="flex items-center gap-2 px-3.5 py-2 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition cursor-pointer"
+                title="顺着链接递归抓取，页数受站点配置限制"
+              >
                 整站抓取
               </button>
 
@@ -512,7 +544,7 @@ export const Sites: React.FC = () => {
 
                 {pages.length === 0 ? (
                   <div className="text-center py-12 text-neutral-500 text-xs">
-                    暂无页面记录，点击右上角【整站抓取】或【批量导入 URL】开始捕获。
+                    暂无页面记录。只要首页请点右上角【抓封面】；要顺着链接抓全站再用【整站抓取】。
                   </div>
                 ) : (
                   pages.map((page) => (
@@ -533,6 +565,23 @@ export const Sites: React.FC = () => {
                         <span className="text-xs text-neutral-400 font-mono mr-1">
                           {page.capture_count} 快照
                         </span>
+                        <button
+                          onClick={async () => {
+                            if (!selectedSiteId) return;
+                            try {
+                              await api.startSingleCapture({ siteId: selectedSiteId, url: page.url });
+                              toast.success('已开始抓取这一页');
+                              setCurrentTab('tasks');
+                            } catch (e: any) {
+                              toast.error(`抓取失败: ${e?.toString()}`);
+                            }
+                          }}
+                          className="px-2 py-1 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded flex items-center gap-1 transition cursor-pointer"
+                          title="只抓这一页，不爬全站"
+                        >
+                          <Play className="w-3 h-3 fill-neutral-400" />
+                          抓此页
+                        </button>
                         <button
                           onClick={() => handleQuickAddMonitor(page.url)}
                           className="px-2 py-1 text-xs bg-neutral-800 hover:bg-neutral-700 text-neutral-300 hover:text-amber-300 rounded flex items-center gap-1 transition cursor-pointer"
@@ -594,7 +643,7 @@ export const Sites: React.FC = () => {
                             </span>
                           </div>
                           <div className="text-xs text-neutral-500 font-mono">
-                            更新于 {new Date(cred.updated_at * 1000).toLocaleString('zh-CN')}
+                            更新于 {new Date(cred.updated_at).toLocaleString('zh-CN')}
                           </div>
                         </div>
 
@@ -706,7 +755,7 @@ export const Sites: React.FC = () => {
                             </span>
                             {feed.last_synced ? (
                               <span className="text-xs font-mono text-neutral-500">
-                                上次同步: {new Date(feed.last_synced * 1000).toLocaleTimeString('zh-CN')}
+                                上次同步: {new Date(feed.last_synced).toLocaleTimeString('zh-CN')}
                               </span>
                             ) : null}
                           </div>

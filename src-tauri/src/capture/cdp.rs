@@ -85,8 +85,9 @@ impl CdpClient {
         user_scripts: Option<&[String]>,
     ) -> Result<CaptureResult> {
         let http_client = reqwest::Client::new();
-        let encoded_target: String = url::form_urlencoded::byte_serialize(target_url.as_bytes()).collect();
-        let new_target_url = format!("http://127.0.0.1:{}/json/new?{}", self.port, encoded_target);
+        // Open a blank tab first so Network.enable can attach before any page resources load.
+        let encoded_blank: String = url::form_urlencoded::byte_serialize(b"about:blank").collect();
+        let new_target_url = format!("http://127.0.0.1:{}/json/new?{}", self.port, encoded_blank);
         let target_info = http_client
             .put(&new_target_url)
             .send()
@@ -255,6 +256,8 @@ impl CdpClient {
         }
         id = self.next_msg_id();
         send_cmd(id, "Network.enable", json!({ "maxTotalBufferSize": 104857600, "maxResourceBufferSize": 52428800 })).await?;
+        id = self.next_msg_id();
+        let _ = send_cmd(id, "Network.setCacheDisabled", json!({ "cacheDisabled": true })).await;
 
         if let Some(cj) = cookies_json {
             if let Ok(cookies_val) = serde_json::from_str::<serde_json::Value>(cj) {
@@ -285,12 +288,12 @@ impl CdpClient {
         send_cmd(id, "Runtime.enable", json!({})).await?;
 
         if let Some(sj) = storage_json {
-            id = self.next_msg_id();
             let script = format!(
                 r#"try {{ const data = {}; for (const [k, v] of Object.entries(data)) {{ localStorage.setItem(k, v); }} }} catch(e) {{}}"#,
                 sj
             );
-            let _ = send_cmd(id, "Runtime.evaluate", json!({ "expression": script })).await;
+            id = self.next_msg_id();
+            let _ = send_cmd(id, "Page.addScriptToEvaluateOnNewDocument", json!({ "source": script })).await;
         }
 
         id = self.next_msg_id();
@@ -305,6 +308,9 @@ impl CdpClient {
         // Wait for page load and events
         let start_time = tokio::time::Instant::now();
         let deadline = start_time + Duration::from_secs(timeout_secs);
+        id = self.next_msg_id();
+        send_cmd(id, "Page.navigate", json!({ "url": target_url })).await?;
+
         let mut loaded = false;
         let mut cf_detected = false;
         let mut cf_resolved = false;
@@ -542,7 +548,7 @@ impl CdpClient {
                                     const totalHeight = document.body.scrollHeight;
                                     const step = Math.min(window.innerHeight * 0.8, 600);
                                     let current = 0;
-                                    while (current < totalHeight && current < 4000) {
+                                    while (current < totalHeight && current < 20000) {
                                         window.scrollBy(0, step);
                                         current += step;
                                         await new Promise(r => setTimeout(r, 120));

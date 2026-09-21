@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    warc_lock: Arc<Mutex<()>>,
     pub base_dir: PathBuf,
 }
 
@@ -23,14 +24,18 @@ impl Database {
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite database at {:?}", db_path))?;
 
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(schema::CREATE_TABLES_SQL)
             .context("Failed to execute initial schema migrations")?;
 
         let _ = conn.execute("ALTER TABLE resources ADD COLUMN warc_length INTEGER DEFAULT 0", []);
         let _ = conn.execute("ALTER TABLE crawl_queue ADD COLUMN error_message TEXT", []);
+        run_migrations(&conn)?;
+        fail_interrupted_jobs(&conn)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            warc_lock: Arc::new(Mutex::new(())),
             base_dir,
         })
     }
@@ -39,6 +44,31 @@ impl Database {
         self.conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock poisoned: {}", e))
+    }
+
+    pub fn lock_warc(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.warc_lock
+            .lock()
+            .map_err(|e| anyhow::anyhow!("WARC lock poisoned: {}", e))
+    }
+
+    pub fn reopen(&self) -> Result<()> {
+        let mut conn = self.lock_conn()?;
+        *conn = Connection::open(self.base_dir.join("app.db"))
+            .context("Failed to reopen SQLite database")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        run_migrations(&conn)?;
+        Ok(())
+    }
+
+    pub fn close_for_replace(&self) -> Result<()> {
+        let conn = self.lock_conn()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        drop(conn);
+        let mut conn = self.lock_conn()?;
+        *conn = Connection::open_in_memory()?;
+        Ok(())
     }
 
     // Sites
@@ -122,12 +152,50 @@ impl Database {
     }
 
     pub fn delete_site(&self, id: &str) -> Result<()> {
-        let conn = self.lock_conn()?;
-        let _ = conn.execute(
-            "DELETE FROM fts_pages WHERE page_id IN (SELECT id FROM pages WHERE site_id = ?1)",
-            params![id],
-        );
-        conn.execute("DELETE FROM sites WHERE id = ?1", params![id])?;
+        if id.is_empty() || id.contains("..") || id.contains('/') || id.contains('\\') {
+            anyhow::bail!("Invalid site id");
+        }
+
+        let screenshot_rels: Vec<String> = {
+            let conn = self.lock_conn()?;
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT c.screenshot_path
+                FROM captures c
+                JOIN pages p ON c.page_id = p.id
+                WHERE p.site_id = ?1 AND c.screenshot_path IS NOT NULL
+                "#,
+            )?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, Option<String>>(0))?;
+            rows.filter_map(|r| r.ok().flatten()).collect()
+        };
+
+        {
+            let conn = self.lock_conn()?;
+            let _ = conn.execute(
+                "DELETE FROM fts_pages WHERE page_id IN (SELECT id FROM pages WHERE site_id = ?1)",
+                params![id],
+            );
+            conn.execute("DELETE FROM sites WHERE id = ?1", params![id])?;
+        }
+
+        let _ = std::fs::remove_dir_all(self.base_dir.join("archives").join(id));
+        let _ = std::fs::remove_dir_all(self.base_dir.join("browser_profiles").join(id));
+
+        for rel in screenshot_rels {
+            let path = self.base_dir.join(&rel);
+            if path.starts_with(&self.base_dir) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(self.base_dir.join("screenshots")) {
+            let prefix = format!("ss_{}_", id);
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         Ok(())
     }
 
@@ -405,6 +473,8 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis();
 
+        let sealed_cookies = crate::protect::seal_text(cookies_json)?;
+        let sealed_storage = crate::protect::seal_text(storage_json)?;
         conn.execute(
             r#"
             INSERT INTO site_credentials (id, site_id, name, cookies_json, storage_json, updated_at)
@@ -414,7 +484,7 @@ impl Database {
                 storage_json = ?5,
                 updated_at = ?6
             "#,
-            params![id, site_id, name, cookies_json, storage_json, now],
+            params![id, site_id, name, sealed_cookies, sealed_storage, now],
         )?;
 
         let cred = conn.query_row(
@@ -431,6 +501,7 @@ impl Database {
                 })
             },
         )?;
+        let cred = decode_credential(cred)?;
 
         Ok(cred)
     }
@@ -453,7 +524,7 @@ impl Database {
 
         let mut list = Vec::new();
         for r in rows {
-            list.push(r?);
+            list.push(decode_credential(r?)?);
         }
         Ok(list)
     }
@@ -772,6 +843,155 @@ impl Database {
     }
 }
 
+fn decode_credential(mut cred: SiteCredential) -> Result<SiteCredential> {
+    cred.cookies_json = crate::protect::open_text(&cred.cookies_json)?;
+    cred.storage_json = crate::protect::open_text(&cred.storage_json)?;
+    Ok(cred)
+}
+
+fn fail_interrupted_jobs(conn: &Connection) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE crawl_jobs SET status = 'failed', finished_at = ?1 WHERE status IN ('running', 'queued')",
+        params![now],
+    )?;
+    Ok(())
+}
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        );
+        "#,
+    )?;
+
+    let version: i32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if version < 1 {
+        conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS fts_pages_mig USING fts5(
+                page_id UNINDEXED,
+                capture_id UNINDEXED,
+                url,
+                title,
+                clean_text,
+                meta_desc,
+                tokenize = 'unicode61'
+            );
+            INSERT INTO fts_pages_mig (page_id, capture_id, url, title, clean_text, meta_desc)
+                SELECT page_id, capture_id, url, title, clean_text, meta_desc FROM fts_pages;
+            DROP TABLE fts_pages;
+            ALTER TABLE fts_pages_mig RENAME TO fts_pages;
+            "#,
+        )?;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            params![now],
+        )?;
+    }
+
+    let version: i32 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    if version < 2 {
+        reindex_fts_cjk(conn)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
+            params![now],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn space_cjk(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' | '\u{20000}'..='\u{2A6DF}'
+        ) {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            out.push(c);
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn reindex_fts_cjk(conn: &Connection) -> Result<()> {
+    let rows: Vec<(String, String, String, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT page_id, capture_id, url, title, clean_text, meta_desc FROM fts_pages",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3).unwrap_or_default(),
+                r.get::<_, String>(4).unwrap_or_default(),
+                r.get::<_, String>(5).unwrap_or_default(),
+            ))
+        })?;
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS fts_pages;
+        CREATE VIRTUAL TABLE fts_pages USING fts5(
+            page_id UNINDEXED,
+            capture_id UNINDEXED,
+            url,
+            title,
+            clean_text,
+            meta_desc,
+            tokenize = 'unicode61'
+        );
+        "#,
+    )?;
+
+    for (page_id, capture_id, url, title, clean_text, meta_desc) in rows {
+        conn.execute(
+            r#"
+            INSERT INTO fts_pages (page_id, capture_id, url, title, clean_text, meta_desc)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                page_id,
+                capture_id,
+                url,
+                space_cjk(&title),
+                space_cjk(&clean_text),
+                space_cjk(&meta_desc)
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,6 +1027,23 @@ mod tests {
         db.remove_page_tag(&p1.id, &tag1.id).expect("Failed to untag page");
         let page_tags_after = db.get_page_tags(&p1.id).expect("Failed to get page tags");
         assert_eq!(page_tags_after.len(), 1);
+
+        let cred = db
+            .save_site_credential(&site.id, "default", r#"[{"name":"sid","value":"abc"}]"#, "{}")
+            .expect("save credential");
+        assert_eq!(cred.cookies_json, r#"[{"name":"sid","value":"abc"}]"#);
+        let stored: String = {
+            let conn = db.lock_conn().unwrap();
+            conn.query_row(
+                "SELECT cookies_json FROM site_credentials WHERE id = ?1",
+                params![cred.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(stored.starts_with("wv1:"), "credentials must be sealed at rest");
+        let loaded = db.get_site_credentials(&site.id).unwrap();
+        assert_eq!(loaded[0].cookies_json, r#"[{"name":"sid","value":"abc"}]"#);
 
         let script = db.save_user_script(
             Some(&site.id),
@@ -864,6 +1101,95 @@ mod tests {
         assert_eq!(rule.enabled, true);
         assert_eq!(rule.url, "https://example.com/check");
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_delete_site_removes_archive_and_profile_dirs() {
+        let temp_dir = std::env::temp_dir().join(format!("webvault_del_{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::init(&temp_dir).expect("init");
+        let site = db.create_site("Delete Me", "https://example.com").unwrap();
+
+        let archive_dir = temp_dir.join("archives").join(&site.id);
+        let profile_dir = temp_dir.join("browser_profiles").join(&site.id);
+        let ss_dir = temp_dir.join("screenshots");
+        std::fs::create_dir_all(&archive_dir).unwrap();
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        std::fs::create_dir_all(&ss_dir).unwrap();
+        std::fs::write(archive_dir.join("data.warc.gz"), b"warc").unwrap();
+        std::fs::write(profile_dir.join("cookie"), b"secret").unwrap();
+        std::fs::write(ss_dir.join(format!("ss_{}_1.jpg", site.id)), b"jpg").unwrap();
+
+        db.delete_site(&site.id).unwrap();
+
+        assert!(db.list_sites().unwrap().is_empty());
+        assert!(!archive_dir.exists());
+        assert!(!profile_dir.exists());
+        assert!(!ss_dir.join(format!("ss_{}_1.jpg", site.id)).exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_completed_update_does_not_overwrite_cancelled() {
+        let temp_dir = std::env::temp_dir().join(format!("webvault_job_{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::init(&temp_dir).unwrap();
+        let site = db.create_site("Jobs", "https://example.com").unwrap();
+        let conn = db.lock_conn().unwrap();
+        conn.execute(
+            "INSERT INTO crawl_jobs (id, site_id, status, started_at) VALUES ('j1', ?1, 'running', 1)",
+            [&site.id],
+        ).unwrap();
+        conn.execute(
+            "UPDATE crawl_jobs SET status = 'cancelled', finished_at = 2 WHERE id = 'j1' AND status = 'running'",
+            [],
+        ).unwrap();
+        let overwritten = conn.execute(
+            "UPDATE crawl_jobs SET status = 'completed', finished_at = 3 WHERE id = 'j1' AND status = 'running'",
+            [],
+        ).unwrap();
+        assert_eq!(overwritten, 0);
+        let status: String = conn.query_row("SELECT status FROM crawl_jobs WHERE id = 'j1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "cancelled");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_concurrent_warc_appends_remain_readable() {
+        use crate::archive::warc::{WarcReader, WarcRecord, WarcWriter};
+        let temp_dir = std::env::temp_dir().join(format!("webvault_cwarc_{}", uuid::Uuid::new_v4().simple()));
+        let db = Database::init(&temp_dir).unwrap();
+        let warc_path = temp_dir.join("data.warc.gz");
+        let writer = std::sync::Arc::new(WarcWriter::new(&warc_path));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let db = db.clone();
+            let writer = writer.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut headers = std::collections::HashMap::new();
+                headers.insert("Content-Type".to_string(), "text/plain".to_string());
+                let body = format!("payload-{}", i);
+                let rec = WarcRecord::create_response_record(
+                    &format!("https://example.com/{}", i),
+                    200,
+                    "OK",
+                    &headers,
+                    body.as_bytes(),
+                );
+                let _g = db.lock_warc().unwrap();
+                writer.append_record(&rec).unwrap()
+            }));
+        }
+        let mut offsets = Vec::new();
+        for h in handles {
+            offsets.push(h.join().unwrap());
+        }
+        for (offset, length) in offsets {
+            let rec = WarcReader::read_record_at(&warc_path, offset, length).expect("record readable after concurrent append");
+            let (_status, _headers, body) = WarcReader::parse_http_response(&rec.content).unwrap();
+            assert!(std::str::from_utf8(&body).unwrap().starts_with("payload-"));
+        }
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

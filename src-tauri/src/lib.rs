@@ -1,14 +1,20 @@
 pub mod archive;
+pub mod backup;
 pub mod capture;
 pub mod cli;
 pub mod commands;
 pub mod crawler;
 pub mod database;
 pub mod diff;
+pub mod http_url;
 pub mod monitor;
+pub mod protect;
 pub mod replay;
 pub mod search;
 pub mod wayback;
+
+#[cfg(test)]
+mod product_flow_test;
 
 use capture::browser::BrowserFinder;
 use commands::*;
@@ -20,15 +26,50 @@ use tauri::Manager;
 use tokio::sync::Mutex;
 use wayback::WaybackProvider;
 
+fn init_logging(base_dir: &std::path::Path) {
+    let log_dir = base_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let env_filter = tracing_subscriber::EnvFilter::new("webvault=debug,info");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("webvault.log"))
+    {
+        Ok(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(TeeWriter { file }))
+                .try_init();
+        }
+        Err(_) => {
+            let _ = tracing_subscriber::fmt().with_env_filter(env_filter).try_init();
+        }
+    }
+}
+
+struct TeeWriter {
+    file: std::fs::File,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write_all(buf);
+        self.file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _ = std::io::stderr().flush();
+        self.file.flush()
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize tracing subscriber
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("webvault=debug,info")
-        .try_init();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data = app
                 .path()
@@ -36,6 +77,7 @@ pub fn run() {
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data"));
             let base_dir = app_data.join("WebVault");
             std::fs::create_dir_all(&base_dir)?;
+            init_logging(&base_dir);
 
             let db = Database::init(&base_dir)?;
             let browser_path = BrowserFinder::find_browser();
@@ -48,9 +90,11 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let replay_server = ReplayServer::start(db_clone).await.expect("Failed to start ReplayServer");
                 let replay_port = replay_server.port;
+                let replay_token = replay_server.token.clone();
                 let monitor_db = db.clone();
+                let monitor_browser = browser_path.clone();
                 tauri::async_runtime::spawn(async move {
-                    let monitor = crate::monitor::MonitorEngine::new(monitor_db);
+                    let monitor = crate::monitor::MonitorEngine::new(monitor_db).with_browser(monitor_browser);
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                         if let Err(e) = monitor.check_pending_rules().await {
@@ -63,6 +107,7 @@ pub fn run() {
                     db,
                     browser_path,
                     replay_port,
+                    replay_token,
                     wayback,
                     active_jobs: Arc::new(Mutex::new(HashMap::new())),
                 };
@@ -99,6 +144,8 @@ pub fn run() {
             import_wayback_capture,
             export_wacz,
             import_wacz,
+            export_backup,
+            import_backup,
             launch_interactive_login,
             save_site_credential,
             get_site_credentials,

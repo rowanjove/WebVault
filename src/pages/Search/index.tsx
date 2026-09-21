@@ -3,6 +3,33 @@ import { Search as SearchIcon, Globe, Clock, PlaySquare, ArrowRight, Tag } from 
 import { useAppStore } from '../../stores/useAppStore';
 import { api } from '../../services/tauri';
 import type { SearchResultItem } from '../../types';
+import { toast } from '../../components/ui/Toast';
+
+function HighlightedSnippet({ text }: { text: string }) {
+  const parts = text.split(/(<mark>|<\/mark>)/);
+  let marked = false;
+  return (
+    <div className="text-xs md:text-sm text-neutral-200 leading-relaxed bg-neutral-950/80 p-3 rounded-lg border border-neutral-800 font-mono">
+      {parts.map((part, i) => {
+        if (part === '<mark>') {
+          marked = true;
+          return null;
+        }
+        if (part === '</mark>') {
+          marked = false;
+          return null;
+        }
+        return marked ? (
+          <mark key={i} className="bg-amber-500/30 text-amber-100 rounded-sm px-0.5">
+            {part}
+          </mark>
+        ) : (
+          <span key={i}>{part}</span>
+        );
+      })}
+    </div>
+  );
+}
 
 export const Search: React.FC = () => {
   const { openTimeMachine } = useAppStore();
@@ -21,8 +48,8 @@ export const Search: React.FC = () => {
       setHasSearched(true);
       const res = await api.search({ query: query.trim() });
       setResults(res);
-    } catch (e) {
-      console.error('Search failed:', e);
+    } catch (e: any) {
+      toast.error(`搜索失败: ${e?.toString?.() || '未知错误'}`);
     } finally {
       setLoading(false);
     }
@@ -123,10 +150,7 @@ export const Search: React.FC = () => {
             <div className="text-xs text-neutral-400 font-mono truncate">{item.url}</div>
 
             {/* Snippet with highlighted mark */}
-            <div
-              className="text-xs md:text-sm text-neutral-200 leading-relaxed bg-neutral-950/80 p-3 rounded-lg border border-neutral-800 font-mono"
-              dangerouslySetInnerHTML={{ __html: item.snippet }}
-            />
+            <HighlightedSnippet text={item.snippet} />
 
             <div className="flex items-center justify-between pt-1 text-xs text-neutral-400">
               <span className="font-medium">站点: {item.site_name}</span>

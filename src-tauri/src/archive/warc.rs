@@ -376,6 +376,61 @@ impl WarcReader {
         let body = content[body_start..].to_vec();
         Ok((status_code, headers, body))
     }
+
+    /// Walk a (possibly gzip-member-concatenated) WARC and yield (offset, length, record).
+    pub fn for_each_record<P, F>(file_path: P, mut visit: F) -> Result<()>
+    where
+        P: AsRef<Path>,
+        F: FnMut(u64, u64, WarcRecord) -> Result<()>,
+    {
+        let path = file_path.as_ref();
+        let data = std::fs::read(path)
+            .with_context(|| format!("Failed to open WARC {:?}", path))?;
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        if path.to_string_lossy().ends_with(".gz") {
+            let mut offset = 0u64;
+            while (offset as usize) < data.len() {
+                let input = &data[offset as usize..];
+                let mut decoder = flate2::bufread::GzDecoder::new(input);
+                let mut decompressed = Vec::new();
+                if decoder.read_to_end(&mut decompressed).is_err() {
+                    break;
+                }
+                let unread = decoder.into_inner();
+                let consumed = (input.len() - unread.len()) as u64;
+                if consumed == 0 {
+                    break;
+                }
+                if let Ok(rec) = Self::parse_record(&decompressed) {
+                    visit(offset, consumed, rec)?;
+                }
+                offset += consumed;
+            }
+        } else {
+            let mut offset = 0usize;
+            while offset < data.len() {
+                while offset < data.len() && matches!(data[offset], b'\r' | b'\n') {
+                    offset += 1;
+                }
+                if offset >= data.len() {
+                    break;
+                }
+                match Self::parse_record(&data[offset..]) {
+                    Ok(rec) => {
+                        let serialized = rec.serialize();
+                        let length = serialized.len() as u64;
+                        visit(offset as u64, length, rec)?;
+                        offset += length as usize;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

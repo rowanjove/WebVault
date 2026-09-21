@@ -110,7 +110,10 @@ impl WaybackProvider {
         let writer = WarcWriter::new(&warc_full_path);
 
         let record = WarcRecord::create_response_record(&item.url, status, "OK", &headers, &body);
-        let (offset, length) = writer.append_record(&record)?;
+        let (offset, length) = {
+            let _warc_guard = db.lock_warc()?;
+            writer.append_record(&record)?
+        };
 
         // Ensure page entry exists
         let normalizer = crate::crawler::normalizer::UrlNormalizer::new();
@@ -164,15 +167,17 @@ impl WaybackProvider {
 
         drop(conn);
 
-        // Index in FTS5
-        let text_content = String::from_utf8_lossy(&body);
+        let html = String::from_utf8_lossy(&body);
+        let clean_text = crate::capture::behavior::TextExtractor::extract_clean_text(&html);
+        let title = crate::capture::behavior::TextExtractor::extract_title(&html)
+            .unwrap_or_else(|| format!("Wayback Snapshot {}", item.timestamp));
         let _ = SearchEngine::index_page(
             db,
             &actual_page_id,
             &cap_id,
             &item.url,
-            &format!("Wayback Snapshot {}", item.timestamp),
-            &text_content,
+            &title,
+            &clean_text,
             "",
         );
 

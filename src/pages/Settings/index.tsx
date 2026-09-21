@@ -13,14 +13,15 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
-import { api } from '../../services/tauri';
+import { api, pickOpenFile, pickSaveFile } from '../../services/tauri';
 import { toast } from '../../components/ui/Toast';
 
 export const Settings: React.FC = () => {
-  const { stats, setSites, theme, toggleTheme, setIsOnboardingOpen } = useAppStore();
+  const { stats, setSites, setStats, theme, toggleTheme, setIsOnboardingOpen } = useAppStore();
   const [importPath, setImportPath] = useState('');
   const [importLoading, setImportLoading] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
+  const [backupLoading, setBackupLoading] = useState(false);
 
   const handleOpenStoragePath = async () => {
     const path = stats?.storage_path;
@@ -127,9 +128,13 @@ export const Settings: React.FC = () => {
               <ShieldCheck className="w-4 h-4 text-emerald-500" />
               浏览器引擎 (CDP)
             </h2>
-            <span className="flex items-center gap-1.5 text-xs font-mono text-emerald-500 bg-emerald-500/10 px-2.5 py-1 rounded border border-emerald-500/20 font-medium">
-              <span className="w-2 h-2 rounded-full bg-emerald-500" />
-              就绪
+            <span className={`flex items-center gap-1.5 text-xs font-mono px-2.5 py-1 rounded border font-medium ${
+              stats?.browser_detected
+                ? 'text-emerald-500 bg-emerald-500/10 border-emerald-500/20'
+                : 'text-amber-400 bg-amber-500/10 border-amber-500/20'
+            }`}>
+              <span className={`w-2 h-2 rounded-full ${stats?.browser_detected ? 'bg-emerald-500' : 'bg-amber-400'}`} />
+              {stats?.browser_detected ? '就绪' : '未检测到'}
             </span>
           </div>
 
@@ -182,11 +187,21 @@ export const Settings: React.FC = () => {
           <form onSubmit={handleImportWacz} className="flex items-center gap-3">
             <input
               type="text"
-              placeholder="输入 .wacz 文件的绝对路径..."
+              placeholder="选择或输入 .wacz 文件路径..."
               value={importPath}
               onChange={(e) => setImportPath(e.target.value)}
               className="flex-1 px-3.5 py-2.5 bg-neutral-950 border border-neutral-800 rounded-lg text-neutral-200 font-mono text-sm focus:outline-hidden focus:border-indigo-500 shadow-2xs"
             />
+            <button
+              type="button"
+              onClick={async () => {
+                const selected = await pickOpenFile([{ name: 'WACZ', extensions: ['wacz'] }]);
+                if (selected) setImportPath(selected);
+              }}
+              className="px-3 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-medium transition shrink-0 cursor-pointer"
+            >
+              浏览
+            </button>
             <button
               type="submit"
               disabled={importLoading}
@@ -204,6 +219,75 @@ export const Settings: React.FC = () => {
           )}
         </div>
 
+        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-5 space-y-3 shadow-2xs">
+          <h2 className="font-semibold text-neutral-100 flex items-center gap-2 text-sm">
+            <HardDrive className="w-4 h-4 text-cyan-400" />
+            数据备份与恢复
+          </h2>
+          <p className="text-xs text-neutral-400">
+            备份包含数据库、WARC 归档、截图和浏览器登录配置目录。恢复会覆盖当前本地数据，请先确认。
+          </p>
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              disabled={backupLoading}
+              onClick={async () => {
+                const path = await pickSaveFile({
+                  defaultPath: `webvault-backup-${Date.now()}.zip`,
+                  filters: [{ name: 'Zip', extensions: ['zip'] }],
+                });
+                if (!path) return;
+                try {
+                  setBackupLoading(true);
+                  const saved = await api.exportBackup(path);
+                  toast.success(`备份已保存：${saved}`);
+                } catch (e: any) {
+                  toast.error(`备份失败: ${e?.toString()}`);
+                } finally {
+                  setBackupLoading(false);
+                }
+              }}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer"
+            >
+              导出备份
+            </button>
+            <button
+              type="button"
+              disabled={backupLoading}
+              onClick={async () => {
+                if (!confirm('恢复备份会覆盖当前归档数据，确定继续？')) return;
+                const path = await pickOpenFile([{ name: 'Zip', extensions: ['zip'] }]);
+                if (!path) return;
+                try {
+                  setBackupLoading(true);
+                  await api.importBackup(path);
+                  const [updated, st] = await Promise.all([api.listSites(), api.getSystemStats()]);
+                  setSites(updated);
+                  setStats(st);
+                  toast.success('备份已恢复');
+                } catch (e: any) {
+                  toast.error(`恢复失败: ${e?.toString()}`);
+                } finally {
+                  setBackupLoading(false);
+                }
+              }}
+              className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 text-neutral-200 rounded-lg text-xs font-semibold cursor-pointer"
+            >
+              从备份恢复
+            </button>
+          </div>
+        </div>
+
+        <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-5 space-y-3 text-neutral-400 text-xs shadow-2xs">
+          <div className="flex items-center gap-2 text-neutral-200 font-semibold text-sm">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            隐私说明
+          </div>
+          <p className="text-neutral-300 leading-relaxed">
+            WebVault 在本机运行，不上传归档、Cookie 或使用数据。登录凭证仅保存在本地数据库，抓取依赖本机已安装的 Chrome / Edge。日志写在存储目录的 logs/webvault.log，不会自动外发。
+          </p>
+        </div>
+
         {/* Software Info */}
         <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-5 space-y-3 text-neutral-400 text-xs shadow-2xs">
           <div className="flex items-center gap-2 text-neutral-200 font-semibold text-sm">
@@ -211,7 +295,7 @@ export const Settings: React.FC = () => {
             关于 WebVault
           </div>
           <div className="grid grid-cols-2 gap-3 pt-1 text-sm text-neutral-300">
-            <div>版本：v0.1.0</div>
+            <div>版本：v0.1.1</div>
             <div>归档格式：WARC 1.1 / WACZ 1.1.1</div>
             <div>存储引擎：SQLite (WAL + FTS5)</div>
             <div>沙箱环境：127.0.0.1 隔离代理</div>

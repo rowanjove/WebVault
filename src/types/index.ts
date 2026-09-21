@@ -115,6 +115,7 @@ export interface MonitorRule {
 export interface ChangeEventItem {
   id: string;
   page_id: string;
+  site_id: string;
   url: string;
   title: string;
   old_capture_id: string;

@@ -28,7 +28,7 @@ import {
   Minus,
 } from 'lucide-react';
 import { useAppStore, TimeMachineMode } from '../../stores/useAppStore';
-import { api } from '../../services/tauri';
+import { api, pickSaveFile } from '../../services/tauri';
 import { toast } from '../../components/ui/Toast';
 import type { PageItem, CaptureItem, ResourceItem, DiffResult, TagItem, BookmarkItem, MonitorRule } from '../../types';
 
@@ -215,13 +215,27 @@ export const TimeMachine: React.FC = () => {
     }
   };
 
+  // Apply store diff pair when entering compare mode from Monitor / Dashboard
+  useEffect(() => {
+    if (timeMachineMode === 'diff' && diffOldCaptureId && diffNewCaptureId) {
+      setCompareTargetId(diffOldCaptureId);
+      if (selectedCaptureId !== diffNewCaptureId) {
+        setSelectedCaptureId(diffNewCaptureId);
+      }
+    }
+  }, [timeMachineMode, diffOldCaptureId, diffNewCaptureId]);
+
   // 7. Diff calculation
   useEffect(() => {
     if (timeMachineMode === 'diff' && captures.length > 1) {
       const currentIdx = captures.findIndex((c) => c.id === selectedCaptureId);
-      // Default comparison target: immediate predecessor or custom compareTargetId
       let targetId = compareTargetId;
-      if (!targetId || targetId === selectedCaptureId) {
+      if (diffOldCaptureId && captures.some((c) => c.id === diffOldCaptureId)) {
+        targetId = diffOldCaptureId;
+        if (targetId !== compareTargetId) {
+          setCompareTargetId(targetId);
+        }
+      } else if (!targetId || targetId === selectedCaptureId) {
         if (currentIdx !== -1 && currentIdx + 1 < captures.length) {
           targetId = captures[currentIdx + 1].id;
         } else if (currentIdx > 0) {
@@ -274,8 +288,12 @@ export const TimeMachine: React.FC = () => {
 
   const handleExportOffline = async (format: 'singlefile' | 'pdf') => {
     if (!selectedCaptureId) return;
-    const defaultName = `webvault_${selectedCaptureId}_${Date.now()}.${format === 'singlefile' ? 'html' : 'pdf'}`;
-    const targetPath = prompt(`请输入导出文件保存路径或文件名：`, defaultName);
+    const ext = format === 'singlefile' ? 'html' : 'pdf';
+    const defaultName = `webvault_${selectedCaptureId}_${Date.now()}.${ext}`;
+    const targetPath = await pickSaveFile({
+      defaultPath: defaultName,
+      filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+    });
     if (!targetPath) return;
     try {
       const resultPath = await api.exportPageOffline({ captureId: selectedCaptureId, format, outputPath: targetPath });
@@ -612,6 +630,7 @@ export const TimeMachine: React.FC = () => {
                       title="Web Archive Replay"
                       className="w-full flex-1 border-0 bg-white"
                       sandbox="allow-scripts allow-same-origin allow-forms"
+                      onContextMenu={(e) => e.preventDefault()}
                     />
                   ) : (
                     <div className="flex-1 flex items-center justify-center text-xs text-neutral-400">

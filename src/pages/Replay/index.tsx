@@ -181,6 +181,7 @@ export const Replay: React.FC = () => {
             referrerPolicy="no-referrer"
             className="w-full h-full border-0 bg-white"
             title="Archived Webpage Replay Sandbox"
+            onContextMenu={(e) => e.preventDefault()}
           />
         ) : (
           <div className="flex-1 flex items-center justify-center text-neutral-500 text-xs">

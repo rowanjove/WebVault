@@ -27,11 +27,16 @@ impl TextExtractor {
     }
 
     pub fn extract_clean_text(html: &str) -> String {
-        let tag_regex = match regex::Regex::new(r"(?s)<(script|style)[^>]*>.*?</\1>") {
+        let script_regex = match regex::Regex::new(r"(?is)<script[^>]*>.*?</script>") {
             Ok(r) => r,
             Err(_) => return html.to_string(),
         };
-        let stripped = tag_regex.replace_all(html, " ");
+        let style_regex = match regex::Regex::new(r"(?is)<style[^>]*>.*?</style>") {
+            Ok(r) => r,
+            Err(_) => return html.to_string(),
+        };
+        let without_script = script_regex.replace_all(html, " ");
+        let stripped = style_regex.replace_all(&without_script, " ");
         let html_tag_regex = match regex::Regex::new(r"<[^>]+>") {
             Ok(r) => r,
             Err(_) => return stripped.to_string(),

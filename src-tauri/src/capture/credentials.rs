@@ -22,13 +22,16 @@ impl CredentialManager {
         let profile_dir = temp_base.join(format!("interactive_login_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&profile_dir)?;
 
+        let safe_url = crate::http_url::require_http_url(login_url)?;
+
         Command::new(browser_path)
             .arg(format!("--remote-debugging-port={}", port))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--disable-blink-features=AutomationControlled")
             .arg(format!("--user-data-dir={}", profile_dir.to_string_lossy()))
-            .arg(login_url)
+            .arg("--")
+            .arg(safe_url.as_str())
             .spawn()
             .with_context(|| format!("Failed to launch visible browser for login at {:?}", browser_path))?;
 

@@ -1,61 +1,99 @@
-use crate::archive::singlefile::SingleFileExporter;
 use crate::archive::warc::WarcReader;
 use crate::database::Database;
-use crate::search::SearchEngine;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
-use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct ReplayState {
     pub db: Database,
     pub port: u16,
+    pub token: String,
+    pub allow_live_fallback: bool,
 }
 
 pub struct ReplayServer {
     pub port: u16,
+    pub token: String,
 }
 
 impl ReplayServer {
     pub async fn start(db: Database) -> anyhow::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
+        Self::bind(db, 0).await
+    }
 
-        let state = ReplayState { db, port };
+    pub async fn bind(db: Database, port: u16) -> anyhow::Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+        let port = listener.local_addr()?.port();
+        let token = uuid::Uuid::new_v4().simple().to_string();
+
+        let state = ReplayState {
+            db,
+            port,
+            token: token.clone(),
+            allow_live_fallback: false,
+        };
 
         let app = Router::new()
             .route("/replay/{capture_id}", get(replay_main_page))
             .route("/replay/{capture_id}/{*url}", get(replay_sub_resource))
             .route("/screenshot/{capture_id}", get(serve_screenshot))
-            // REST API endpoints
             .route("/api/v1/health", get(api_health))
-            .route("/api/v1/stats", get(api_stats))
-            .route("/api/v1/sites", get(api_sites))
-            .route("/api/v1/pages", get(api_pages))
-            .route("/api/v1/captures", get(api_captures))
-            .route("/api/v1/captures/{id}", get(api_capture_detail))
-            .route("/api/v1/search", get(api_search))
-            .route("/api/v1/export", post(api_export))
             .fallback(get(fallback_replay_resource))
-            .layer(CorsLayer::permissive())
+            .layer(middleware::from_fn_with_state(state.clone(), replay_auth))
             .with_state(state);
 
         tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
-                tracing::error!("Replay & API server error: {}", e);
+                tracing::error!("Replay server error: {}", e);
             }
         });
 
-        Ok(Self { port })
+        Ok(Self { port, token })
     }
+}
+
+pub fn request_has_token(token: &str, headers: &HeaderMap, query: Option<&str>) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some(value) = pair.strip_prefix("t=") {
+                if value == token {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(cookie) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        for part in cookie.split(';') {
+            if let Some(value) = part.trim().strip_prefix("wv_t=") {
+                if value == token {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+async fn replay_auth(State(state): State<ReplayState>, req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if path == "/api/v1/health" {
+        return next.run(req).await;
+    }
+    let query = req.uri().query().map(|s| s.to_string());
+    if !request_has_token(&state.token, req.headers(), query.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    }
+    next.run(req).await
 }
 
 use regex::Regex;
@@ -99,7 +137,7 @@ async fn replay_main_page(
 
     let final_body = if mime.contains("text/html") {
         let text = String::from_utf8_lossy(&body);
-        rewrite_html_for_replay(&capture_id, &target_url, &text).into_bytes()
+        rewrite_html_for_replay(&capture_id, &target_url, &text, &state.token).into_bytes()
     } else {
         body
     };
@@ -118,13 +156,16 @@ async fn replay_main_page(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
     );
+    if let Ok(cookie) = HeaderValue::from_str(&format!("wv_t={}; Path=/; HttpOnly; SameSite=Lax", state.token)) {
+        response_headers.insert(header::SET_COOKIE, cookie);
+    }
 
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
     (status_code, response_headers, final_body).into_response()
 }
 
 /// Rewrite HTML content for accurate archive replay
-fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str) -> String {
+fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str, token: &str) -> String {
     let mut rewritten = html.to_string();
 
     // 1. Enforce no-referrer meta policy to bypass CDN hotlink protection
@@ -136,9 +177,14 @@ fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str) -> St
 
     // 2. Inject Sandbox client shim, base tag and Fetch/XHR proxy
     let replay_prefix = format!("/replay/{}/", capture_id);
+    let page_origin = url::Url::parse(target_url)
+        .ok()
+        .map(url_origin_string)
+        .unwrap_or_default();
+    let base_href = replay_base_href(capture_id, target_url);
     let shim_script = format!(
-        r#"<meta name="referrer" content="no-referrer"><base href="{0}"><script>(()=>{{const p='{0}';try{{window.localStorage.getItem('_test');}}catch(e){{const m={{}};const s={{getItem:k=>k in m?m[k]:null,setItem:(k,v)=>{{m[k]=String(v);}},removeItem:k=>{{delete m[k];}},clear:()=>{{for(let k in m)delete m[k];}},key:i=>Object.keys(m)[i]||null,get length(){{return Object.keys(m).length;}}}};try{{Object.defineProperty(window,'localStorage',{{value:s,configurable:true}});}}catch(er){{}}try{{Object.defineProperty(window,'sessionStorage',{{value:s,configurable:true}});}}catch(er){{}}}}const of=window.fetch;window.fetch=function(u,i){{if(typeof u==='string'){{if(u.startsWith('//'))u=p+'https:'+u;else if(u.startsWith('http://')||u.startsWith('https://'))u=p+u;else if(u.startsWith('/')&&!u.startsWith('/replay/'))u=p+u.slice(1);}}return of.call(this,u,i);}};const ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,...r){{if(typeof u==='string'){{if(u.startsWith('//'))u=p+'https:'+u;else if(u.startsWith('http://')||u.startsWith('https://'))u=p+u;else if(u.startsWith('/')&&!u.startsWith('/replay/'))u=p+u.slice(1);}}return ox.call(this,m,u,...r);}};window.addEventListener('DOMContentLoaded',()=>{{document.querySelectorAll('canvas[data-webvault-canvas-snapshot]').forEach(c=>{{const s=c.getAttribute('data-webvault-canvas-snapshot');if(s){{const img=new Image();img.onload=()=>{{const ctx=c.getContext('2d');if(ctx)ctx.drawImage(img,0,0,c.width,c.height);}};img.src=s;}}}});}});}})();</script>"#,
-        replay_prefix
+        r#"<meta name="referrer" content="no-referrer"><base href="{1}"><script>(()=>{{const p='{0}';const o='{2}';const tk='{3}';window.addEventListener('contextmenu',e=>{{e.preventDefault();e.stopPropagation();}},true);try{{window.localStorage.getItem('_test');}}catch(e){{const m={{}};const s={{getItem:k=>k in m?m[k]:null,setItem:(k,v)=>{{m[k]=String(v);}},removeItem:k=>{{delete m[k];}},clear:()=>{{for(let k in m)delete m[k];}},key:i=>Object.keys(m)[i]||null,get length(){{return Object.keys(m).length;}}}};try{{Object.defineProperty(window,'localStorage',{{value:s,configurable:true}});}}catch(er){{}}try{{Object.defineProperty(window,'sessionStorage',{{value:s,configurable:true}});}}catch(er){{}}}}const withT=u=>{{if(!tk||typeof u!=='string'||u.indexOf('t=')>=0)return u;return u+(u.indexOf('?')>=0?'&':'?')+'t='+tk;}};const rw=u=>{{if(typeof u!=='string')return u;let n=u;if(u.startsWith('//'))n=p+'https:'+u;else if(u.startsWith('http://')||u.startsWith('https://'))n=p+u;else if(u.startsWith('/')&&!u.startsWith('/replay/'))n=p+o+u;return withT(n);}};const of=window.fetch;window.fetch=function(u,i){{if(typeof u==='string')u=rw(u);return of.call(this,u,i);}};const ox=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u,...r){{if(typeof u==='string')u=rw(u);return ox.call(this,m,u,...r);}};window.addEventListener('DOMContentLoaded',()=>{{document.querySelectorAll('canvas[data-webvault-canvas-snapshot]').forEach(c=>{{const s=c.getAttribute('data-webvault-canvas-snapshot');if(s){{const img=new Image();img.onload=()=>{{const ctx=c.getContext('2d');if(ctx)ctx.drawImage(img,0,0,c.width,c.height);}};img.src=s;}}}});}});}})();</script>"#,
+        replay_prefix, base_href, page_origin, token
     );
 
     let head_re = Regex::new(r#"(?i)<head\b[^>]*>"#).unwrap();
@@ -158,21 +204,21 @@ fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str) -> St
             return trimmed.to_string();
         }
         if trimmed.starts_with(&replay_prefix) {
-            return trimmed.to_string();
+            return with_replay_token(trimmed, token);
         }
         if let Some(ref base) = parsed_base {
             if let Ok(joined) = base.join(trimmed) {
                 let s = joined.to_string();
                 if s.starts_with("http://") || s.starts_with("https://") {
-                    return format!("{}{}", replay_prefix, s);
+                    return with_replay_token(&format!("{}{}", replay_prefix, s), token);
                 }
             }
         }
         if trimmed.starts_with("//") {
-            return format!("{}https:{}", replay_prefix, trimmed);
+            return with_replay_token(&format!("{}https:{}", replay_prefix, trimmed), token);
         }
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-            return format!("{}{}", replay_prefix, trimmed);
+            return with_replay_token(&format!("{}{}", replay_prefix, trimmed), token);
         }
         trimmed.to_string()
     };
@@ -221,6 +267,18 @@ fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str) -> St
         }).to_string();
     }
 
+    // Keep in-page navigation inside the replay sandbox
+    if let Ok(nav_re) = Regex::new(r#"(?i)<(a|area|form)\b([^>]*)\b(href|action)=["']([^"']+)["']([^>]*)>"#) {
+        rewritten = nav_re.replace_all(&rewritten, |caps: &regex::Captures| {
+            let tag = &caps[1];
+            let before = &caps[2];
+            let attr = &caps[3];
+            let raw = &caps[4];
+            let after = &caps[5];
+            format!(r#"<{}{}{}="{}"{}>"#, tag, before, attr, rewrite_single_url(raw), after)
+        }).to_string();
+    }
+
     // Rewrite CSS url(...) background-images and web fonts in <style> or inline styles
     if let Ok(css_url_re) = Regex::new(r#"(?i)url\(\s*['"]?((?:https?://|//|/|\./|\.\./)[^'")\s]+)['"]?\s*\)"#) {
         rewritten = css_url_re.replace_all(&rewritten, |caps: &regex::Captures| {
@@ -231,6 +289,99 @@ fn rewrite_html_for_replay(capture_id: &str, target_url: &str, html: &str) -> St
     }
 
     rewritten
+}
+
+fn replay_base_href(capture_id: &str, target_url: &str) -> String {
+    let prefix = format!("/replay/{}/", capture_id);
+    let Ok(u) = url::Url::parse(target_url) else {
+        return prefix;
+    };
+    let mut path = u.path().to_string();
+    if !path.ends_with('/') {
+        if let Some(idx) = path.rfind('/') {
+            path.truncate(idx + 1);
+        } else {
+            path = "/".to_string();
+        }
+    }
+    format!("{}{}{}", prefix, url_origin_string(u), path)
+}
+
+fn url_origin_string(u: url::Url) -> String {
+    match u.origin() {
+        url::Origin::Tuple(scheme, host, port) => {
+            let host = host.to_string();
+            let default = match scheme.as_str() {
+                "http" => 80,
+                "https" => 443,
+                _ => port,
+            };
+            if port == default {
+                format!("{}://{}", scheme, host)
+            } else {
+                format!("{}://{}:{}", scheme, host, port)
+            }
+        }
+        url::Origin::Opaque(_) => format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()),
+    }
+}
+
+fn with_replay_token(url: &str, token: &str) -> String {
+    if token.is_empty() || url.contains("t=") {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{}&t={}", url, token)
+    } else {
+        format!("{}?t={}", url, token)
+    }
+}
+
+fn rewrite_css_urls(capture_id: &str, css_url: &str, css: &str, token: &str) -> String {
+    let replay_prefix = format!("/replay/{}/", capture_id);
+    let parsed_base = url::Url::parse(css_url).ok();
+    let rewrite_single_url = |val: &str| -> String {
+        let trimmed = val.trim();
+        if trimmed.is_empty() || trimmed.starts_with("data:") || trimmed.starts_with('#') {
+            return trimmed.to_string();
+        }
+        if trimmed.starts_with(&replay_prefix) {
+            return with_replay_token(trimmed, token);
+        }
+        if let Some(ref base) = parsed_base {
+            if let Ok(joined) = base.join(trimmed) {
+                let s = joined.to_string();
+                if s.starts_with("http://") || s.starts_with("https://") {
+                    return with_replay_token(&format!("{}{}", replay_prefix, s), token);
+                }
+            }
+        }
+        if trimmed.starts_with("//") {
+            return with_replay_token(&format!("{}https:{}", replay_prefix, trimmed), token);
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return with_replay_token(&format!("{}{}", replay_prefix, trimmed), token);
+        }
+        trimmed.to_string()
+    };
+    if let Ok(css_url_re) = Regex::new(r#"(?i)url\(\s*['"]?((?:https?://|//|/|\./|\.\./)[^'")\s]+)['"]?\s*\)"#) {
+        return css_url_re
+            .replace_all(css, |caps: &regex::Captures| {
+                format!("url('{}')", rewrite_single_url(&caps[1]))
+            })
+            .to_string();
+    }
+    css.to_string()
+}
+
+fn is_static_asset(url: &str) -> bool {
+    let lower = url.split('?').next().unwrap_or(url).to_lowercase();
+    [
+        ".css", ".js", ".mjs", ".woff2", ".woff", ".ttf", ".otf", ".eot", ".png", ".jpg", ".jpeg",
+        ".gif", ".webp", ".avif", ".svg", ".ico", ".bmp", ".map",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
 }
 
 /// Normalizes resource URL from request path, handling URL percent-decoding and protocol restoring
@@ -358,6 +509,9 @@ async fn replay_sub_resource(
                         || k_lower == "content-length"
                         || k_lower == "transfer-encoding"
                         || k_lower == "content-security-policy"
+                        || k_lower == "set-cookie"
+                        || k_lower == "location"
+                        || k_lower == "www-authenticate"
                     {
                         continue;
                     }
@@ -371,13 +525,22 @@ async fn replay_sub_resource(
                 response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                 response_headers.insert(HeaderName::from_static("x-webvault-source"), HeaderValue::from_static("archive"));
                 let st = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+                let body = if mime.contains("text/css") || target_url.to_lowercase().contains(".css") {
+                    rewrite_css_urls(&capture_id, &target_url, &String::from_utf8_lossy(&body), &state.token).into_bytes()
+                } else if mime.contains("text/html") {
+                    rewrite_html_for_replay(&capture_id, &target_url, &String::from_utf8_lossy(&body), &state.token).into_bytes()
+                } else {
+                    body
+                };
                 return (st, response_headers, body).into_response();
             }
         }
     }
 
-    // Transparent online proxy fallback if resource is an absolute URL not yet in WARC
-    if target_url.starts_with("http://") || target_url.starts_with("https://") {
+    if state.allow_live_fallback
+        && is_static_asset(&target_url)
+        && (target_url.starts_with("http://") || target_url.starts_with("https://"))
+    {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .build();
@@ -415,7 +578,18 @@ async fn replay_sub_resource(
                 response_headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
                 response_headers.insert(HeaderName::from_static("x-webvault-source"), HeaderValue::from_static("live-fallback"));
                 if let Ok(bytes) = resp.bytes().await {
-                    return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK), response_headers, bytes).into_response();
+                    let is_css = response_headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.contains("text/css"))
+                        .unwrap_or(false)
+                        || target_url.to_lowercase().contains(".css");
+                    let body = if is_css {
+                        rewrite_css_urls(&capture_id, &target_url, &String::from_utf8_lossy(&bytes), &state.token).into_bytes()
+                    } else {
+                        bytes.to_vec()
+                    };
+                    return (StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK), response_headers, body).into_response();
                 }
             }
         }
@@ -472,134 +646,12 @@ async fn fallback_replay_resource(
     (StatusCode::NOT_FOUND, "Resource not found in archive").into_response()
 }
 
-// REST API handlers
-
 async fn api_health() -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "service": "WebVault Local Web Time Machine",
-        "version": "0.1.0"
+        "version": "0.1.1"
     }))
-}
-
-async fn api_stats(State(state): State<ReplayState>) -> Response {
-    let conn = match state.db.lock_conn() {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database locked").into_response(),
-    };
-
-    let site_count: i64 = conn.query_row("SELECT COUNT(*) FROM sites", [], |r| r.get(0)).unwrap_or(0);
-    let page_count: i64 = conn.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0)).unwrap_or(0);
-    let capture_count: i64 = conn.query_row("SELECT COUNT(*) FROM captures", [], |r| r.get(0)).unwrap_or(0);
-    let resource_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |r| r.get(0)).unwrap_or(0);
-    let storage_bytes: i64 = conn.query_row("SELECT COALESCE(SUM(warc_length), 0) FROM captures", [], |r| r.get(0)).unwrap_or(0);
-
-    Json(json!({
-        "site_count": site_count,
-        "page_count": page_count,
-        "capture_count": capture_count,
-        "resource_count": resource_count,
-        "storage_bytes": storage_bytes,
-        "storage_path": state.db.base_dir.to_string_lossy()
-    })).into_response()
-}
-
-async fn api_sites(State(state): State<ReplayState>) -> Response {
-    match state.db.list_sites() {
-        Ok(sites) => Json(json!(sites)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-async fn api_pages(
-    State(state): State<ReplayState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let site_id = params.get("site_id");
-    match site_id {
-        Some(sid) => match state.db.list_pages(sid) {
-            Ok(pages) => Json(json!(pages)).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        None => (StatusCode::BAD_REQUEST, "Missing site_id query parameter").into_response(),
-    }
-}
-
-async fn api_captures(
-    State(state): State<ReplayState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let page_id = params.get("page_id");
-    match page_id {
-        Some(pid) => match state.db.list_captures(pid) {
-            Ok(captures) => Json(json!(captures)).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        },
-        None => (StatusCode::BAD_REQUEST, "Missing page_id query parameter").into_response(),
-    }
-}
-
-async fn api_capture_detail(
-    State(state): State<ReplayState>,
-    Path(capture_id): Path<String>,
-) -> Response {
-    match state.db.get_capture_details(&capture_id) {
-        Ok((capture, resources, rendered_text)) => Json(json!({
-            "capture": capture,
-            "resources": resources,
-            "rendered_text": rendered_text
-        })).into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
-    }
-}
-
-async fn api_search(
-    State(state): State<ReplayState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    let query = params.get("q").cloned().unwrap_or_default();
-    if query.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "Missing search query parameter 'q'").into_response();
-    }
-    match SearchEngine::search(&state.db, &query, None) {
-        Ok(results) => Json(json!(results)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExportPayload {
-    pub capture_id: String,
-    pub format: String, // "singlefile" or "pdf"
-    pub output_path: String,
-}
-
-async fn api_export(
-    State(state): State<ReplayState>,
-    Json(payload): Json<ExportPayload>,
-) -> Response {
-    let clean_path_str = payload.output_path.trim();
-    if clean_path_str.is_empty() || clean_path_str.contains("..") {
-        return (StatusCode::BAD_REQUEST, "Invalid output path: path traversal detected").into_response();
-    }
-
-    let path = PathBuf::from(clean_path_str);
-    // Disallow writing directly to sensitive system locations
-    let path_str_lower = clean_path_str.to_lowercase();
-    if path_str_lower.starts_with("c:\\windows") || path_str_lower.starts_with("/etc") || path_str_lower.starts_with("/bin") {
-        return (StatusCode::FORBIDDEN, "Target path points to protected system directory").into_response();
-    }
-
-    let result = match payload.format.as_str() {
-        "singlefile" => SingleFileExporter::export_single_file_html(&state.db, &payload.capture_id, &path),
-        "pdf" => SingleFileExporter::export_pdf(&state.db, &payload.capture_id, state.port, &path).await,
-        _ => return (StatusCode::BAD_REQUEST, "Unsupported format: use 'singlefile' or 'pdf'").into_response(),
-    };
-
-    match result {
-        Ok(_) => Json(json!({ "success": true, "output_path": payload.output_path })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    }
 }
 
 #[cfg(test)]
@@ -619,6 +671,24 @@ mod tests {
             .await
             .expect("Failed to call health");
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let denied = client
+            .get(format!("http://127.0.0.1:{}/replay/cap_x", server.port))
+            .send()
+            .await
+            .expect("replay without token");
+        assert_eq!(denied.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let allowed = client
+            .get(format!("http://127.0.0.1:{}/replay/cap_x?t={}", server.port, server.token))
+            .send()
+            .await
+            .expect("replay with token");
+        assert_ne!(allowed.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        assert!(request_has_token("abc", &HeaderMap::new(), Some("t=abc")));
+        assert!(!request_has_token("abc", &HeaderMap::new(), Some("t=nope")));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -644,7 +714,7 @@ mod tests {
         "#;
         let cap_id = "cap_test_123";
         let target_url = "https://www.bilibili.com/video/";
-        let rewritten = rewrite_html_for_replay(cap_id, target_url, sample_html);
+        let rewritten = rewrite_html_for_replay(cap_id, target_url, sample_html, "");
         println!("REWRITTEN RESULT:\n{}", rewritten);
 
         assert!(rewritten.contains(r#"<meta name="referrer" content="no-referrer">"#));
@@ -669,55 +739,32 @@ mod tests {
             normalize_requested_resource_url("https%3A%2F%2Fs1.hdslb.com%2Ftest.css"),
             "https://s1.hdslb.com/test.css"
         );
-    }
-
-    #[tokio::test]
-    async fn test_replay_against_actual_user_data() {
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let db_dir = std::path::PathBuf::from(appdata).join("com.webvault.app").join("WebVault");
-        if !db_dir.join("app.db").exists() {
-            println!("No existing user data, skipping test");
-            return;
-        }
-
-        let db = Database::init(&db_dir).expect("Failed to open user db");
-        let server = ReplayServer::start(db.clone()).await.expect("Failed to start server");
-        let client = reqwest::Client::new();
-
-        let cap_id: String = {
-            let conn = db.lock_conn().unwrap();
-            conn.query_row("SELECT id FROM captures ORDER BY captured_at DESC LIMIT 1", [], |r| r.get(0)).unwrap()
-        };
-        println!("Testing with latest cap_id: {}", cap_id);
-
-        // 1. Check main page
-        let page_resp = client.get(format!("http://127.0.0.1:{}/replay/{}", server.port, cap_id))
-            .send()
-            .await
-            .expect("Failed to request replay main page");
-        assert_eq!(page_resp.status(), reqwest::StatusCode::OK);
-        let html = page_resp.text().await.unwrap();
-
-        // Print all link tags in the returned HTML!
-        for line in html.lines() {
-            if line.contains("<link") {
-                println!("REPLAY LINK TAG: {}", line.trim());
-            }
-        }
-
-        // 2. Check CSS sub-resource (Archived)
-        let css_url = format!(
-            "http://127.0.0.1:{}/replay/{}/https://s1.hdslb.com/bfs/static/shanks/laputa-home/assets/index-c5e37698.css",
-            server.port, cap_id
+        assert_eq!(
+            replay_base_href("cap_1", "https://example.com/foo/bar.html"),
+            "/replay/cap_1/https://example.com/foo/"
         );
-        let css_resp = client.get(&css_url).send().await.expect("Failed to request CSS");
-        println!("CSS STATUS: {}", css_resp.status());
-        println!("CSS HEADERS: {:?}", css_resp.headers());
-        assert_eq!(css_resp.status(), reqwest::StatusCode::OK);
-        let css_bytes = css_resp.bytes().await.unwrap();
-        println!("CSS BYTES LEN: {}", css_bytes.len());
-        assert!(css_bytes.len() > 100_000, "CSS should be ~363KB");
-        println!("CSS VERIFIED SUCCESSFULLY");
+        assert_eq!(
+            replay_base_href("cap_1", "https://example.com:8443/foo/bar.html"),
+            "/replay/cap_1/https://example.com:8443/foo/"
+        );
+        let with_link = rewrite_html_for_replay(
+            "cap_1",
+            "https://example.com/page",
+            r#"<html><body><a href="https://example.com/next">n</a></body></html>"#,
+            "tok",
+        );
+        assert!(with_link.contains(r#"href="/replay/cap_1/https://example.com/next?t=tok""#));
+        assert!(with_link.contains("contextmenu"));
+        assert!(is_static_asset("https://cdn.example.com/app.css"));
+        assert!(!is_static_asset("https://example.com/article/1"));
+        let css = rewrite_css_urls(
+            "cap_1",
+            "https://example.com/css/app.css",
+            "body{background:url('../img/bg.png')}",
+            "",
+        );
+        assert!(css.contains("/replay/cap_1/https://example.com/img/bg.png"));
     }
+
 }
 

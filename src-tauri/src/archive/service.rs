@@ -29,6 +29,8 @@ impl CapturePersistenceService {
         let normalizer = UrlNormalizer::new();
         let norm_url = normalizer.normalize(&capture.url).unwrap_or_else(|_| capture.url.clone());
 
+        let _warc_guard = db.lock_warc()?;
+
         let screenshot_rel_path = if let Some(ref ss_bytes) = capture.screenshot_bytes {
             let ss_name = format!("ss_{}_{}.jpg", site_id, now);
             let ss_dir = db.base_dir.join("screenshots");

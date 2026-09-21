@@ -226,7 +226,12 @@ export const Monitor: React.FC = () => {
 
                     {ev.old_capture_id && (
                       <button
-                        onClick={() => setDiffPair(ev.old_capture_id!, ev.new_capture_id)}
+                        onClick={() =>
+                          setDiffPair(ev.old_capture_id!, ev.new_capture_id, {
+                            siteId: ev.site_id,
+                            pageId: ev.page_id,
+                          })
+                        }
                         className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
                       >
                         <GitCompare className="w-3.5 h-3.5 text-amber-400" />
@@ -235,7 +240,13 @@ export const Monitor: React.FC = () => {
                     )}
 
                     <button
-                      onClick={() => openTimeMachine({ captureId: ev.new_capture_id })}
+                      onClick={() =>
+                        openTimeMachine({
+                          siteId: ev.site_id,
+                          pageId: ev.page_id,
+                          captureId: ev.new_capture_id,
+                        })
+                      }
                       className="px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-lg text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
                     >
                       <Clock className="w-3.5 h-3.5 text-indigo-400" />

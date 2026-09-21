@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
 import { api } from '../../services/tauri';
+import { toast } from '../../components/ui/Toast';
 import type { Site, ChangeEventItem, CrawlJob } from '../../types';
 
 export const Dashboard: React.FC = () => {
@@ -81,9 +82,10 @@ export const Dashboard: React.FC = () => {
 
       await api.startSingleCapture({ siteId: site.id, url: target });
       setQuickUrl('');
+      toast.success('已加入抓取队列');
       setCurrentTab('tasks');
-    } catch (err) {
-      console.error('Quick capture error:', err);
+    } catch (err: any) {
+      toast.error(`抓取失败: ${err?.toString?.() || '未知错误'}`);
     } finally {
       setQuickLoading(false);
     }
@@ -325,6 +327,8 @@ export const Dashboard: React.FC = () => {
                             ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-400'
                             : job.status === 'completed'
                             ? 'bg-neutral-800 text-neutral-400'
+                            : job.status === 'cancelled' || job.status === 'queued' || job.status === 'paused'
+                            ? 'bg-neutral-800 text-neutral-500'
                             : 'bg-red-500/20 text-red-500 dark:text-red-400'
                         }`}
                       >
@@ -379,7 +383,12 @@ export const Dashboard: React.FC = () => {
                       <span>{formatDate(event.created_at)}</span>
                       {event.old_capture_id && (
                         <button
-                          onClick={() => setDiffPair(event.old_capture_id!, event.new_capture_id)}
+                          onClick={() =>
+                            setDiffPair(event.old_capture_id!, event.new_capture_id, {
+                              siteId: event.site_id,
+                              pageId: event.page_id,
+                            })
+                          }
                           className="text-indigo-600 dark:text-indigo-400 hover:underline text-xs font-medium cursor-pointer"
                         >
                           比对 →

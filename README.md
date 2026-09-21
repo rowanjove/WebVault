@@ -128,7 +128,10 @@ webvault search "rust release"
 # 导出整站为 WACZ 规范文件
 webvault export --site-id <SITE_ID> --output archive.wacz
 
-# 启动本地离线回放服务
+# 导出单页为离线 HTML / PDF
+webvault export <capture_id> --format html --output page.html
+
+# 启动本地离线回放服务（需带 token 访问 /replay/<id>?t=<token>）
 webvault serve --port 8080
 ```
 
@@ -165,8 +168,10 @@ webvault serve --port 8080
 ## 安全与隐私说明
 
 1. **零外部数据收集**：WebVault 完全运行于用户本机环境，不包含任何遥测、分析或云端上报代码。
-2. **凭据安全**：登录抓取时保存的 Cookie 与凭据仅存储于本地 SQLite 数据库中，严禁明文导出或同步。
-3. **沙箱隔离**：离线回放归档网页时，所有页面运行在独立的沙箱 iframe 与本地反向代理内，自动剥离恶意重定向脚本，且无权调用 Tauri 的底层原生 API。
+2. **凭据安全**：登录 Cookie 仅保存在本机 SQLite，不会同步到云端。界面不会回传 Cookie 正文。备份 zip 含归档与数据库，请自行保管。
+3. **沙箱隔离**：离线回放运行在本机回放服务中，默认不代理外网缺失资源。回放请求需要启动时签发的 token，归档页无法调用 Tauri 原生 API。
+4. **日志**：运行日志写入应用数据目录下的 `logs/webvault.log`，不会自动外发。
+5. **备份**：在设置页可导出/恢复包含数据库、WARC 与截图的数据包。
 
 ---
 

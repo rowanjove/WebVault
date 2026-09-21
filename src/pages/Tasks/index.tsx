@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '../../stores/useAppStore';
 import { api } from '../../services/tauri';
+import { toast } from '../../components/ui/Toast';
 import type { CrawlJob } from '../../types';
 
 export const Tasks: React.FC = () => {
@@ -34,11 +35,12 @@ export const Tasks: React.FC = () => {
   }, []);
 
   const handleCancel = async (id: string) => {
+    if (!confirm('确定要终止这个任务吗？')) return;
     try {
       await api.cancelJob(id);
       loadJobs();
-    } catch (e) {
-      console.error(e);
+    } catch (e: any) {
+      toast.error(`终止失败: ${e?.toString?.() || e}`);
     }
   };
 
@@ -103,6 +105,8 @@ export const Tasks: React.FC = () => {
                           ? 'bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30 animate-pulse'
                           : job.status === 'completed'
                           ? 'bg-neutral-800 text-neutral-300'
+                          : job.status === 'cancelled' || job.status === 'queued' || job.status === 'paused'
+                          ? 'bg-neutral-800 text-neutral-400'
                           : 'bg-red-500/20 text-red-400'
                       }`}
                     >

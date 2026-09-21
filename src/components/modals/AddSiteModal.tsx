@@ -11,7 +11,7 @@ export const AddSiteModal: React.FC = () => {
   const [mode, setMode] = useState<'single' | 'crawl'>('single');
   const [scopeType, setScopeType] = useState<'current' | 'prefix' | 'host' | 'domain'>('host');
   const [maxDepth, setMaxDepth] = useState(2);
-  const [maxPages, setMaxPages] = useState(200);
+  const [maxPages, setMaxPages] = useState(30);
   const [autoscroll, setAutoscroll] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,6 +35,14 @@ export const AddSiteModal: React.FC = () => {
       }
 
       const siteName = name.trim() || new URL(formattedUrl).hostname;
+
+      if (mode === 'crawl') {
+        if (!confirm(`整站抓取最多 ${maxPages} 页，会顺着链接继续访问。只要封面请改选「只要这一页」。确定继续？`)) {
+          setLoading(false);
+          return;
+        }
+      }
+
       const site = await api.createSite({ name: siteName, rootUrl: formattedUrl });
 
       if (mode === 'crawl') {
@@ -127,8 +135,8 @@ export const AddSiteModal: React.FC = () => {
               >
                 <Zap className="w-5 h-5 text-indigo-500 shrink-0" />
                 <div>
-                  <div className="font-semibold text-neutral-100 text-sm">单页抓取</div>
-                  <div className="text-xs text-neutral-400 mt-0.5">仅抓取当前 URL 及其资源</div>
+                  <div className="font-semibold text-neutral-100 text-sm">只要这一页</div>
+                  <div className="text-xs text-neutral-400 mt-0.5">只抓封面/当前 URL，不往下爬</div>
                 </div>
               </button>
 
@@ -144,7 +152,7 @@ export const AddSiteModal: React.FC = () => {
                 <Sliders className="w-5 h-5 text-indigo-500 shrink-0" />
                 <div>
                   <div className="font-semibold text-neutral-100 text-sm">整站抓取</div>
-                  <div className="text-xs text-neutral-400 mt-0.5">递归探索子链接并捕获</div>
+                  <div className="text-xs text-neutral-400 mt-0.5">会顺着链接继续抓，可能很多页</div>
                 </div>
               </button>
             </div>

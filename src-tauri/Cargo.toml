@@ -1,6 +1,6 @@
 [package]
 name = "webvault"
-version = "0.1.0"
+version = "0.1.1"
 description = "WebVault - Local Web Time Machine Desktop Application"
 edition = "2021"
 
@@ -14,6 +14,7 @@ tauri-build = { version = "2.6", features = [] }
 [dependencies]
 tauri = { version = "2.11", features = [] }
 tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -26,7 +27,6 @@ uuid = { version = "1.11", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 url = "2.5"

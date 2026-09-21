@@ -164,6 +164,7 @@ fn default_true() -> bool {
 pub struct ChangeEventItem {
     pub id: String,
     pub page_id: String,
+    pub site_id: String,
     pub url: String,
     pub title: String,
     pub old_capture_id: Option<String>,

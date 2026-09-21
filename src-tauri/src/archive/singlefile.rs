@@ -202,6 +202,7 @@ impl SingleFileExporter {
         db: &Database,
         capture_id: &str,
         replay_port: u16,
+        replay_token: &str,
         output_path: &Path,
     ) -> Result<()> {
         let browser_path = BrowserFinder::find_browser()
@@ -211,7 +212,7 @@ impl SingleFileExporter {
         let temp_dir = db.base_dir.join("temp");
         let browser_proc = BrowserFinder::launch(&browser_path, port, &temp_dir).await?;
 
-        let replay_url = format!("http://127.0.0.1:{}/replay/{}", replay_port, capture_id);
+        let replay_url = format!("http://127.0.0.1:{}/replay/{}?t={}", replay_port, capture_id, replay_token);
         let cdp = CdpClient::new(browser_proc.port);
 
         let pdf_bytes = cdp.print_to_pdf(&replay_url).await?;
